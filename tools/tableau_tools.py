@@ -1,7 +1,7 @@
 import time
 import uuid
 
-_DEFAULT_SCOPES = ["tableau:content:read", "tableau:tasks:run"]
+_DEFAULT_SCOPES = ["tableau:content:read", "tableau:tasks:run", "tableau:views:download"]
 
 
 def generate_jwt(
@@ -88,12 +88,19 @@ def list_workbooks(session: dict, max_items: int = 1000) -> list:
     return [_workbook(item) for item in items]
 
 
-def list_views(session: dict, workbook_id: str | None = None, max_items: int = 10) -> list:
-    """Return views on the site. Pass workbook_id to keep one workbook."""
-    items = _paged(session, "/views", "views", "view", max_items=max_items)
+def list_views(session: dict, workbook_id: str | None = None, max_items: int = 100) -> list:
+    """Return views. Pass workbook_id to list that workbook's views."""
     if workbook_id:
-        items = [item for item in items if (item.get("workbook") or {}).get("id") == workbook_id]
-    return [_view(item) for item in items]
+        items = _paged(session, f"/workbooks/{workbook_id}/views", "views", "view", max_items=max_items)
+    else:
+        items = _paged(session, "/views", "views", "view", max_items=max_items)
+    views = []
+    for item in items:
+        view = _view(item)
+        if workbook_id and not view.get("workbook_id"):
+            view["workbook_id"] = workbook_id
+        views.append(view)
+    return views
 
 
 def list_datasources(session: dict, max_items: int = 1000) -> list:
@@ -132,22 +139,45 @@ def get_view_data(session: dict, view_id: str, max_rows: int = 500) -> dict:
     }
 
 
-def get_view_image(session: dict, view_id: str, output_path: str) -> dict:
-    """Download a rendered view image and return the file path."""
-    return _download_view(session, view_id, "image", "image/png", output_path)
+def get_view_image(session: dict, view_id: str, output_path: str | None = None) -> dict:
+    """Download a rendered view as PNG. output_path defaults to reports/{view_id}.png."""
+    path = output_path or f"reports/{view_id}.png"
+    return _download_view(
+        session,
+        view_id,
+        "image",
+        path,
+        {"resolution": "high", "vizWidth": 1200, "vizHeight": 800},
+        (b"\x89PNG", b"\xff\xd8\xff"),
+    )
 
 
-def get_view_pdf(session: dict, view_id: str, output_path: str) -> dict:
-    """Download a rendered view PDF and return the file path."""
-    return _download_view(session, view_id, "pdf", "application/pdf", output_path)
+def get_view_pdf(session: dict, view_id: str, output_path: str | None = None) -> dict:
+    """Download a rendered view as PDF. output_path defaults to reports/{view_id}.pdf."""
+    path = output_path or f"reports/{view_id}.pdf"
+    return _download_view(
+        session,
+        view_id,
+        "pdf",
+        path,
+        {"type": "A4", "orientation": "Landscape"},
+        (b"%PDF",),
+    )
 
 
-def publish_sales_workbook(session: dict, file_path: str, name: str | None = None) -> dict:
-    """Read a local CSV with the file tools and publish those rows as a Tableau workbook."""
+def publish_sales_workbook(
+    session: dict,
+    file_path: str,
+    name: str | None = None,
+    chart: str | None = None,
+    dimension: str | None = None,
+    measure: str | None = None,
+) -> dict:
+    """Read a local CSV with the file tools and publish a table or the requested chart."""
     from pathlib import Path
 
     columns, rows, kinds = _load_user_csv(file_path)
-    dimension, measure = _chart_fields(columns, kinds)
+    view = _view_spec(columns, kinds, chart, dimension, measure)
     workbook_name = (name or Path(file_path).stem).strip() or Path(file_path).stem
     projects = list_projects(session)
     if not projects:
@@ -155,7 +185,7 @@ def publish_sales_workbook(session: dict, file_path: str, name: str | None = Non
     project = projects[0]
     slug = _file_slug(workbook_name)
     hyper_path = _write_hyper(columns, kinds, rows, Path("reports") / f"{slug}.hyper")
-    twbx_path = _write_twbx(workbook_name, columns, kinds, dimension, measure, hyper_path)
+    twbx_path = _write_twbx(workbook_name, columns, kinds, view, hyper_path)
     try:
         datasource = _publish_file(
             session,
@@ -176,16 +206,20 @@ def publish_sales_workbook(session: dict, file_path: str, name: str | None = Non
     finally:
         hyper_path.unlink(missing_ok=True)
         twbx_path.unlink(missing_ok=True)
+    published = _workbook(workbook.get("workbook") or {})
     return {
         "source_file": file_path,
         "name": workbook_name,
         "columns": columns,
-        "dimension": dimension,
-        "measure": measure,
+        "chart": view["chart"],
+        "dimension": view["dimension"],
+        "measure": view["measure"],
+        "sheet": view["sheet"],
         "project": project,
         "row_count": len(rows),
         "datasource": _datasource(datasource.get("datasource") or {}),
-        "workbook": _workbook(workbook.get("workbook") or {}),
+        "workbook": published,
+        "views": published.get("views") or [],
     }
 
 
@@ -256,13 +290,17 @@ def _as_list(value) -> list:
 
 def _workbook(item: dict) -> dict:
     project = item.get("project") or {}
-    return {
+    views = [_view(view) for view in _as_list((item.get("views") or {}).get("view"))]
+    workbook = {
         "id": item.get("id"),
         "name": item.get("name"),
         "content_url": item.get("contentUrl"),
         "webpage_url": item.get("webpageUrl"),
         "project": project.get("name"),
     }
+    if views:
+        workbook["views"] = views
+    return workbook
 
 
 def _datasource(item: dict) -> dict:
@@ -335,14 +373,43 @@ def _send(session: dict, method: str, path: str, *, accept: str, params: dict | 
     return response
 
 
-def _download_view(session: dict, view_id: str, kind: str, accept: str, output_path: str) -> dict:
+def _download_view(session: dict, view_id: str, kind: str, output_path: str, params: dict, signatures: tuple) -> dict:
+    import time
     from pathlib import Path
 
-    response = _send(session, "GET", f"/views/{view_id}/{kind}", accept=accept, timeout=90)
-    path = Path(output_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(response.content)
-    return {"view_id": view_id, "file_path": str(path), "bytes_written": len(response.content)}
+    view_id = str(view_id).strip()
+    last_error = None
+    for accept in ("*/*", "application/json"):
+        for attempt in range(2):
+            try:
+                response = _send(
+                    session,
+                    "GET",
+                    f"/views/{view_id}/{kind}",
+                    accept=accept,
+                    params=params,
+                    timeout=90,
+                )
+            except RuntimeError as error:
+                last_error = error
+                message = str(error)
+                if attempt == 0 and any(code in message for code in ("404", "409", "503")):
+                    time.sleep(2)
+                    continue
+                if "406" in message:
+                    break
+                raise
+            content = response.content
+            if content.startswith(signatures):
+                path = Path(output_path)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(content)
+                return {"view_id": view_id, "file_path": str(path), "bytes_written": len(content)}
+            detail = content[:500].decode("utf-8", errors="replace").strip()
+            raise RuntimeError(f"Tableau {kind} did not return a file: {detail}")
+    if last_error:
+        raise last_error
+    raise RuntimeError(f"Tableau {kind} download failed for view {view_id}")
 
 
 def _view(item: dict) -> dict:
@@ -413,18 +480,68 @@ def _column_kinds(columns: list, rows: list) -> dict:
     return kinds
 
 
-def _chart_fields(columns: list, kinds: dict) -> tuple:
+_CHARTS = {
+    "bar": "bar",
+    "bar chart": "bar",
+    "column": "bar",
+    "horizontal bar": "horizontal_bar",
+    "horizontal_bar": "horizontal_bar",
+    "line": "line",
+    "line chart": "line",
+    "area": "area",
+    "area chart": "area",
+    "circle": "circle",
+    "scatter": "circle",
+    "square": "square",
+    "pie": "pie",
+    "pie chart": "pie",
+    "table": "table",
+    "text": "table",
+    "none": "table",
+    "data": "table",
+}
+
+
+def _view_spec(columns: list, kinds: dict, chart: str | None, dimension: str | None, measure: str | None) -> dict:
+    requested = (chart or "table").strip().lower()
+    kind = _CHARTS.get(requested)
+    if kind is None:
+        choices = "table, bar, horizontal_bar, line, area, circle, square, pie"
+        raise ValueError(f"Unknown chart '{chart}'. Use one of: {choices}")
     text = [name for name in columns if kinds[name] == "text"]
     numbers = [name for name in columns if kinds[name] == "number"]
-    dimension = next((name for name in ("Region", "Category", "Product") if name in text), None)
-    if dimension is None and text:
-        dimension = text[0]
-    measure = next((name for name in ("Sales", "Profit") if name in numbers), None)
-    if measure is None and numbers:
-        measure = numbers[0]
-    if dimension is None or measure is None:
-        raise ValueError("CSV needs at least one text column and one numeric column")
-    return dimension, measure
+    if kind == "table" and not dimension and not measure:
+        dimension_name = text[0] if text else None
+        measure_name = numbers[0] if numbers else None
+    else:
+        dimension_name = _match_column(dimension, columns)
+        measure_name = _match_column(measure, columns)
+    if dimension_name is None or measure_name is None:
+        raise ValueError(
+            "Choose a text dimension and a numeric measure from the file. "
+            f"Text columns: {', '.join(text) or 'none'}. "
+            f"Numeric columns: {', '.join(numbers) or 'none'}."
+        )
+    if kinds[dimension_name] != "text":
+        raise ValueError(f"{dimension_name} is numeric. Use a text column as the dimension.")
+    if kinds[measure_name] != "number":
+        raise ValueError(f"{measure_name} is not numeric. Use a numeric column as the measure.")
+    return {
+        "chart": kind,
+        "dimension": dimension_name,
+        "measure": measure_name,
+        "sheet": f"{measure_name} by {dimension_name}",
+    }
+
+
+def _match_column(name: str | None, columns: list) -> str | None:
+    if name is None or not str(name).strip():
+        return None
+    wanted = str(name).strip().lower()
+    for column in columns:
+        if column.lower() == wanted:
+            return column
+    raise ValueError(f"Column not in the file: {name}. Columns: {', '.join(columns)}")
 
 
 def _file_slug(name: str) -> str:
@@ -481,26 +598,31 @@ def _hyper_value(kind: str, value: str):
     return value
 
 
-def _write_twbx(name: str, columns: list, kinds: dict, dimension: str, measure: str, hyper_path):
+def _write_twbx(name: str, columns: list, kinds: dict, view: dict, hyper_path):
     import zipfile
     from pathlib import Path
 
     hyper_name = Path(hyper_path).name
     twbx_path = Path(hyper_path).with_suffix(".twbx")
-    twb = _workbook_twb(name, columns, kinds, dimension, measure, hyper_name)
+    twb = _workbook_twb(name, columns, kinds, view, hyper_name)
     with zipfile.ZipFile(twbx_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr(Path(hyper_path).with_suffix(".twb").name, twb)
         archive.write(hyper_path, f"Data/{hyper_name}")
     return twbx_path
 
 
-def _workbook_twb(name: str, columns: list, kinds: dict, dimension: str, measure: str, hyper_name: str) -> str:
+def _workbook_twb(name: str, columns: list, kinds: dict, view: dict, hyper_name: str) -> str:
+    dimension = view["dimension"]
+    measure = view["measure"]
     caption = _xml_text(name)
-    sheet = _xml_text(f"{measure} by {dimension}")
+    sheet = _xml_text(view["sheet"])
     dimension_ref = _xml_text(_bracket(dimension))
     measure_ref = _xml_text(_bracket(measure))
     dimension_local = _local_name(dimension)
     measure_local = _local_name(measure)
+    dimension_field = f"[federated.0].[none:{dimension_local}:nk]"
+    measure_field = f"[federated.0].[sum:{measure_local}:qk]"
+    mark, rows, cols, encodings = _mark_layout(view["chart"], dimension_field, measure_field)
     column_xml = "\n".join(_column_xml(column, kinds[column]) for column in columns)
     chart_xml = "\n".join(
         [
@@ -510,6 +632,8 @@ def _workbook_twb(name: str, columns: list, kinds: dict, dimension: str, measure
             f"            <column-instance column='{measure_ref}' derivation='Sum' name='[sum:{measure_local}:qk]' pivot='key' type='quantitative' />",
         ]
     )
+    rows_xml = f"<rows>{rows}</rows>" if rows else "<rows />"
+    cols_xml = f"<cols>{cols}</cols>" if cols else "<cols />"
     return f"""<?xml version='1.0' encoding='utf-8' ?>
 <workbook source-build='2024.2.0' source-platform='mac' version='18.1' xmlns:user='http://www.tableausoftware.com/xml/user'>
   <preferences />
@@ -544,11 +668,12 @@ def _workbook_twb(name: str, columns: list, kinds: dict, dimension: str, measure
             <view>
               <breakdown value='auto' />
             </view>
-            <mark class='Bar' />
+            <mark class='{mark}' />
+            {encodings}
           </pane>
         </panes>
-        <rows>[federated.0].[sum:{measure_local}:qk]</rows>
-        <cols>[federated.0].[none:{dimension_local}:nk]</cols>
+        {rows_xml}
+        {cols_xml}
       </table>
     </worksheet>
   </worksheets>
@@ -575,6 +700,24 @@ def _workbook_twb(name: str, columns: list, kinds: dict, dimension: str, measure
   </windows>
 </workbook>
 """
+
+
+def _mark_layout(chart: str, dimension_field: str, measure_field: str) -> tuple:
+    if chart == "horizontal_bar":
+        return "Bar", dimension_field, measure_field, ""
+    if chart == "table":
+        encodings = f"<encodings><text column='{measure_field}' /></encodings>"
+        return "Text", dimension_field, "", encodings
+    if chart == "pie":
+        encodings = (
+            "<encodings>"
+            f"<color column='{dimension_field}' />"
+            f"<wedge-size column='{measure_field}' />"
+            "</encodings>"
+        )
+        return "Pie", "", "", encodings
+    marks = {"bar": "Bar", "line": "Line", "area": "Area", "circle": "Circle", "square": "Square"}
+    return marks[chart], measure_field, dimension_field, ""
 
 
 def _column_xml(name: str, kind: str) -> str:

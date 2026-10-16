@@ -14,9 +14,10 @@ Export these before running:
     python tableau_workflow.py
 
 TABLEAU_API_VERSION defaults to 3.29.
-TABLEAU_SCOPES defaults to tableau:content:read,tableau:tasks:run.
-Publishing a workbook also needs tableau:datasources:create, tableau:workbooks:create,
-and tableau:views:download enabled on the connected app and included in TABLEAU_SCOPES.
+TABLEAU_SCOPES defaults to tableau:content:read,tableau:tasks:run,tableau:views:download.
+Publishing a workbook also needs tableau:datasources:create and tableau:workbooks:create
+enabled on the connected app and included in TABLEAU_SCOPES.
+Image and PDF download need tableau:views:download on the connected app.
 """
 
 import inspect
@@ -137,7 +138,10 @@ def run():
 
     scopes = [
         scope.strip()
-        for scope in os.getenv("TABLEAU_SCOPES", "tableau:content:read,tableau:tasks:run").split(",")
+        for scope in os.getenv(
+            "TABLEAU_SCOPES",
+            "tableau:content:read,tableau:tasks:run,tableau:views:download",
+        ).split(",")
         if scope.strip()
     ]
     session = sign_in(
@@ -178,31 +182,39 @@ def run():
             return get_job(session, job_id)
 
         def views(workbook_id: str | None = None) -> list:
-            """List Tableau views. Optional argument: workbook_id."""
+            """List Tableau views. Pass workbook_id to list that workbook's views."""
             return list_views(session, workbook_id or None)
 
         def view_data(view_id: str, max_rows: int = 500) -> dict:
             """Read CSV data from a view. Arguments: view_id, max_rows."""
             return get_view_data(session, view_id, max_rows)
 
-        def view_image(view_id: str, output_path: str) -> dict:
-            """Download a view as PNG. Arguments: view_id, output_path."""
+        def view_image(view_id: str, output_path: str | None = None) -> dict:
+            """Download a view as PNG. Arguments: view_id, optional output_path."""
             return get_view_image(session, view_id, output_path)
 
-        def view_pdf(view_id: str, output_path: str) -> dict:
-            """Download a view as PDF. Arguments: view_id, output_path."""
+        def view_pdf(view_id: str, output_path: str | None = None) -> dict:
+            """Download a view as PDF. Arguments: view_id, optional output_path."""
             return get_view_pdf(session, view_id, output_path)
 
         def projects() -> list:
             """List Tableau projects. No arguments."""
             return list_projects(session)
 
-        def publish_sales(file_path: str, name: str | None = None) -> dict:
-            """Read a local CSV through the file tools and publish those rows with a bar chart. Arguments: file_path, optional name."""
-            result = publish_sales_workbook(session, file_path, name)
+        def publish_sales(
+            file_path: str,
+            name: str | None = None,
+            chart: str | None = None,
+            dimension: str | None = None,
+            measure: str | None = None,
+        ) -> dict:
+            """Publish a local CSV as a table or the requested chart. Arguments: file_path, optional name, chart, dimension, measure."""
+            result = publish_sales_workbook(session, file_path, name, chart, dimension, measure)
             workbook = result.get("workbook") or {}
             print(
-                f"Published {result.get('name')} ({result.get('row_count')} rows from {file_path}) "
+                f"Published {result.get('name')} as {result.get('chart')} of "
+                f"{result.get('measure')} by {result.get('dimension')} "
+                f"({result.get('row_count')} rows from {file_path}) "
                 f"to Tableau: {workbook.get('webpage_url') or workbook.get('id')}"
             )
             return result
@@ -239,18 +251,26 @@ You can call only the tools listed below. Call one tool at a time.
 - replace_in_file(path, old, new): replace every occurrence of old text with new text in an existing file.
 - list_projects(): list Tableau projects.
 - list_workbooks(): list workbooks already published on this Tableau site.
-- list_views(workbook_id): list views. Omit workbook_id to list every view.
+- list_views(workbook_id): list views for one workbook. Omit workbook_id to list views on the site.
 - list_datasources(): list data sources already published on this Tableau site.
 - get_view_data(view_id, max_rows): read up to max_rows CSV rows from a view.
-- get_view_image(view_id, output_path): download a view as a PNG file.
-- get_view_pdf(view_id, output_path): download a view as a PDF file.
+- get_view_image(view_id, output_path): download a view as a PNG file. Use a view id from publish_sales_workbook or list_views. output_path is optional.
+- get_view_pdf(view_id, output_path): download a view as a PDF file. Use a view id from publish_sales_workbook or list_views. output_path is optional.
 - refresh_workbook(workbook_id): reload the extract for an existing workbook. List workbooks first and use an id from that result.
 - refresh_datasource(datasource_id): reload the extract for an existing data source. List data sources first and use an id from that result.
 - get_job(job_id): check the refresh job returned by a refresh tool.
-- publish_sales_workbook(file_path, name): read the user's CSV through the file tools and publish those rows with a bar chart. name is optional.
+- publish_sales_workbook(file_path, name, chart, dimension, measure): read the user's CSV through the file tools and publish it. name is optional.
 
 A refresh reloads an existing extract. It does not add the user's rows.
-When the user wants their own data in Tableau, call read_file on the file path they gave, then call publish_sales_workbook with that same file_path. The publish tool reads the file through the file tools and builds the extract and chart from those rows. Do not invent rows.
+When the user wants their own data in Tableau, call read_file on the file path they gave. Then choose the view from that file and the question:
+- Use chart="table" when they ask to publish, load, or see the data and do not ask for a chart.
+- Use chart="bar" or "horizontal_bar" when they ask for a bar chart or a comparison across categories.
+- Use chart="line" or "area" when they ask for a trend over time.
+- Use chart="pie" when they ask for a pie chart or a share of a whole.
+- Use chart="circle" for a scatter plot and chart="square" for a square mark.
+- Set dimension to the text column that answers the question, and measure to the numeric column. Do not use Region and Sales unless the question is about those columns. If they name no columns, choose a category column and a numeric column that exist in the file and say which ones you used.
+Then call publish_sales_workbook with that file_path, chart, dimension, and measure. Do not invent rows.
+For an image or PDF, call get_view_image or get_view_pdf with a view id returned by publish or list_views. If the publish result has no views, call list_views with the new workbook id.
 Use a file tool when the question asks to read or change a local file.
 
 Reply with only this JSON object:
@@ -300,22 +320,22 @@ Tool signatures:
                     except KeyError:
                         print("Invalid data")
                         break
-                    except TypeError as error:
-                        print(f"Invalid arguments: {error}")
-                        break
                     except Exception as error:
                         print(error)
-                        break
+                        snapshot = {"error": str(error)}
 
                     user_prompt = (
                         f"User question: {user_question}\n"
                         f"Required data: {json.dumps(snapshot, default=str)}\n"
                         "Continue the tool sequence. Read or write files when still needed. "
-                        "If this result is the user's file and they want it in Tableau, call "
+                        "If this result is the user's file and they want it in Tableau, choose chart, "
+                        "dimension, and measure from the question and these columns, then call "
                         "publish_sales_workbook with that file path. Do not paste rows into the tool. "
+                        "If they asked for an image or PDF, call get_view_image or get_view_pdf with a view id. "
+                        "If the tool returned an error, correct the arguments and try again. "
                         "When the requested Tableau work is done, answer in valid JSON "
                         "with data_needed=false, data=null, reprompt=false, "
-                        "and response copying names, ids, row counts, and job status from the tool result."
+                        "and response copying names, ids, chart, row counts, file paths, and job status from the tool result."
                     )
             except (json.JSONDecodeError, KeyError) as error:
                 print(f"Invalid response: {error}")
