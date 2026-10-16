@@ -178,18 +178,29 @@ def publish_sales_workbook(
     dimension: str | None = None,
     measure: str | None = None,
 ) -> dict:
-    """Read a local CSV with the file tools and publish a table or the requested chart."""
+    """Publish a CSV. Sheets are built from that file's columns unless dimension and measure are passed."""
     from pathlib import Path
 
     columns, rows, kinds = _load_user_csv(file_path)
-    view = _view_spec(columns, kinds, chart, dimension, measure)
+    if dimension or measure:
+        views = [_view_spec(columns, kinds, chart, dimension, measure)]
+        dashboard = None
+    else:
+        columns, kinds, views = _views_from_data(columns, rows, kinds)
+        dashboard = _dashboard_name(views)
     workbook_name = (name or Path(file_path).stem).strip() or Path(file_path).stem
+    print(
+        f"Publishing {workbook_name} from {file_path}: "
+        + ", ".join(view["sheet"] for view in views)
+    )
     projects = list_projects(session)
     if not projects:
         raise RuntimeError("Tableau site has no project to publish into")
     project = projects[0]
     slug = _file_slug(workbook_name)
-    twbx_path, csv_path = _write_twbx(workbook_name, columns, kinds, rows, view, Path("reports") / f"{slug}.csv")
+    twbx_path, csv_path = _write_twbx(
+        workbook_name, columns, kinds, rows, views, Path("reports") / f"{slug}.csv"
+    )
     try:
         workbook = _publish_file(
             session,
@@ -203,14 +214,18 @@ def publish_sales_workbook(
         csv_path.unlink(missing_ok=True)
         twbx_path.unlink(missing_ok=True)
     published = _workbook(workbook.get("workbook") or {})
+    first = views[0]
     return {
         "source_file": file_path,
         "name": workbook_name,
         "columns": columns,
-        "chart": view["chart"],
-        "dimension": view["dimension"],
-        "measure": view["measure"],
-        "sheet": view["sheet"],
+        "column_kinds": kinds,
+        "sheets": views,
+        "dashboard": dashboard,
+        "chart": first["chart"],
+        "dimension": first["dimension"],
+        "measure": first["measure"],
+        "sheet": first["sheet"],
         "project": project,
         "row_count": len(rows),
         "workbook": published,
@@ -459,20 +474,53 @@ def _load_user_csv(file_path: str) -> tuple:
 def _column_kinds(columns: list, rows: list) -> dict:
     kinds = {}
     for name in columns:
-        numeric = True
-        seen = False
-        for row in rows:
-            value = row[name]
-            if value == "":
-                continue
-            seen = True
-            try:
-                float(value)
-            except ValueError:
-                numeric = False
-                break
-        kinds[name] = "number" if seen and numeric else "text"
+        values = [row[name] for row in rows if row[name] != ""]
+        if values and all(_looks_like_date(value) for value in values):
+            kinds[name] = "date"
+        elif values and all(_is_number(value) for value in values):
+            kinds[name] = "number"
+        else:
+            kinds[name] = "text"
     return kinds
+
+
+def _looks_like_date(value: str) -> bool:
+    if len(value) < 10 or value[4] != "-" or value[7] != "-":
+        return False
+    if len(value) > 10 and value[10] not in " T":
+        return False
+    try:
+        year, month, day = int(value[0:4]), int(value[5:7]), int(value[8:10])
+    except ValueError:
+        return False
+    return year >= 1000 and 1 <= month <= 12 and 1 <= day <= 31
+
+
+def _is_number(value: str) -> bool:
+    try:
+        float(value)
+    except ValueError:
+        return False
+    return True
+
+
+def _is_identifier(name: str, rows: list) -> bool:
+    folded = "".join(ch.lower() if ch.isalnum() else " " for ch in name)
+    tokens = [token for token in folded.split() if token]
+    if "id" not in tokens and not folded.replace(" ", "").endswith("id"):
+        return False
+    if folded.replace(" ", "").endswith("valid"):
+        return False
+    values = [row[name] for row in rows if row[name] != ""]
+    if not values:
+        return False
+    return len(set(values)) >= len(values) * 0.9
+
+
+def _is_category(distinct: int, nonempty: int) -> bool:
+    if distinct < 2 or distinct > 30 or nonempty == 0:
+        return False
+    return (distinct / nonempty) <= 0.5 or distinct <= 8
 
 
 _CHARTS = {
@@ -517,8 +565,8 @@ def _view_spec(columns: list, kinds: dict, chart: str | None, dimension: str | N
             f"Text columns: {', '.join(text) or 'none'}. "
             f"Numeric columns: {', '.join(numbers) or 'none'}."
         )
-    if kinds[dimension_name] != "text":
-        raise ValueError(f"{dimension_name} is numeric. Use a text column as the dimension.")
+    if kinds[dimension_name] not in ("text", "date"):
+        raise ValueError(f"{dimension_name} is numeric. Use a text or date column as the dimension.")
     if kinds[measure_name] != "number":
         raise ValueError(f"{measure_name} is not numeric. Use a numeric column as the measure.")
     return {
@@ -527,6 +575,80 @@ def _view_spec(columns: list, kinds: dict, chart: str | None, dimension: str | N
         "measure": measure_name,
         "sheet": f"{measure_name} by {dimension_name}",
     }
+
+
+def _views_from_data(columns: list, rows: list, kinds: dict) -> tuple:
+    """Build one sheet per useful category, number, and date found in this file."""
+    columns = list(columns)
+    kinds = dict(kinds)
+    profiles = {
+        name: [row[name] for row in rows if row[name] != ""]
+        for name in columns
+    }
+    measures = [
+        name
+        for name in columns
+        if kinds[name] == "number" and not _is_identifier(name, rows)
+    ][:4]
+    categories = [
+        name
+        for name in columns
+        if kinds[name] == "text"
+        and not _is_identifier(name, rows)
+        and _is_category(len(set(profiles[name])), len(profiles[name]))
+    ]
+    categories.sort(key=lambda name: (len(set(profiles[name])), columns.index(name)))
+    categories = categories[:4]
+    dates = [name for name in columns if kinds[name] == "date" and not _is_identifier(name, rows)]
+    if not measures and (categories or dates):
+        measure_name = "Row Count" if "Records" in columns else "Records"
+        columns.append(measure_name)
+        kinds[measure_name] = "number"
+        for row in rows:
+            row[measure_name] = "1"
+        measures = [measure_name]
+    views = []
+    if categories and measures:
+        for measure in measures:
+            views.append(_sheet("horizontal_bar", categories[0], measure))
+    if dates and measures:
+        for measure in measures:
+            views.append(_sheet("line", dates[0], measure))
+    if categories and measures:
+        for category in categories[1:]:
+            views.append(_sheet("horizontal_bar", category, measures[0]))
+    if not views:
+        labels = ", ".join(f"{name} ({kinds[name]})" for name in columns)
+        raise ValueError(
+            "This file has no category or date column to graph against its numbers. "
+            f"Columns: {labels}."
+        )
+    unique = []
+    seen = set()
+    for view in views:
+        if view["sheet"] in seen:
+            continue
+        seen.add(view["sheet"])
+        unique.append(view)
+    return columns, kinds, unique[:8]
+
+
+def _sheet(chart: str, dimension: str, measure: str) -> dict:
+    return {
+        "chart": chart,
+        "dimension": dimension,
+        "measure": measure,
+        "sheet": f"{measure} by {dimension}",
+    }
+
+
+def _dashboard_name(views: list) -> str | None:
+    if len(views) < 2:
+        return None
+    names = {view["sheet"] for view in views}
+    if "Overview" in names:
+        return "Dashboard"
+    return "Overview"
 
 
 def _match_column(name: str | None, columns: list) -> str | None:
@@ -557,46 +679,34 @@ def _write_csv(columns: list, rows: list, csv_path):
     return path
 
 
-def _write_twbx(name: str, columns: list, kinds: dict, rows: list, view: dict, csv_path):
+def _write_twbx(name: str, columns: list, kinds: dict, rows: list, views: list, csv_path):
     import zipfile
     from pathlib import Path
 
     csv_file = _write_csv(columns, rows, csv_path)
     csv_name = Path(csv_file).name
     twbx_path = Path(csv_file).with_suffix(".twbx")
-    twb = _workbook_twb(name, columns, kinds, view, csv_name)
+    twb = _workbook_twb(name, columns, kinds, views, csv_name)
     with zipfile.ZipFile(twbx_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr(Path(csv_file).with_suffix(".twb").name, twb)
         archive.write(csv_file, f"Data/{csv_name}")
     return twbx_path, csv_file
 
 
-def _workbook_twb(name: str, columns: list, kinds: dict, view: dict, csv_name: str) -> str:
-    dimension = view["dimension"]
-    measure = view["measure"]
+def _workbook_twb(name: str, columns: list, kinds: dict, views: list, csv_name: str) -> str:
     caption = _xml_text(name)
-    sheet = _xml_text(view["sheet"])
-    dimension_ref = _xml_text(_bracket(dimension))
-    measure_ref = _xml_text(_bracket(measure))
-    dimension_local = _local_name(dimension)
-    measure_local = _local_name(measure)
-    dimension_field = f"[federated.0].[none:{dimension_local}:nk]"
-    measure_field = f"[federated.0].[sum:{measure_local}:qk]"
-    mark, rows, cols, encodings = _mark_layout(view["chart"], dimension_field, measure_field)
+    locals_by_column = _local_names(columns)
     column_xml = "\n".join(_column_xml(column, kinds[column]) for column in columns)
-    relation_columns = "\n".join(_relation_column(column, kinds[column], index) for index, column in enumerate(columns))
+    relation_columns = "\n".join(
+        _relation_column(column, kinds[column], index) for index, column in enumerate(columns)
+    )
     table_name = _xml_text("[" + csv_name.replace(".", "#") + "]")
     csv_xml = _xml_text(csv_name)
-    chart_xml = "\n".join(
-        [
-            _column_xml(dimension, kinds[dimension]),
-            _column_xml(measure, kinds[measure]),
-            f"            <column-instance column='{dimension_ref}' derivation='None' name='[none:{dimension_local}:nk]' pivot='key' type='nominal' />",
-            f"            <column-instance column='{measure_ref}' derivation='Sum' name='[sum:{measure_local}:qk]' pivot='key' type='quantitative' />",
-        ]
+    worksheets = "\n".join(
+        _worksheet_xml(caption, view, kinds, locals_by_column) for view in views
     )
-    rows_xml = f"<rows>{rows}</rows>" if rows else "<rows />"
-    cols_xml = f"<cols>{cols}</cols>" if cols else "<cols />"
+    dashboard = _dashboards_xml(views)
+    windows = _windows_xml(views)
     return f"""<?xml version='1.0' encoding='utf-8' ?>
 <workbook source-build='2024.2.0' source-platform='mac' version='18.1' xmlns:user='http://www.tableausoftware.com/xml/user'>
   <preferences />
@@ -618,7 +728,57 @@ def _workbook_twb(name: str, columns: list, kinds: dict, view: dict, csv_name: s
     </datasource>
   </datasources>
   <worksheets>
-    <worksheet name='{sheet}'>
+{worksheets}
+  </worksheets>
+{dashboard}  <windows source-height='30'>
+{windows}
+  </windows>
+</workbook>
+"""
+
+
+_WINDOW_CARDS = """      <cards>
+        <edge name='left'>
+          <strip size='160'>
+            <card type='pages' />
+            <card type='filters' />
+            <card type='marks' />
+          </strip>
+        </edge>
+        <edge name='top'>
+          <strip size='31'>
+            <card type='columns' />
+          </strip>
+          <strip size='31'>
+            <card type='rows' />
+          </strip>
+        </edge>
+      </cards>"""
+
+
+def _worksheet_xml(caption: str, view: dict, kinds: dict, locals_by_column: dict) -> str:
+    dimension = view["dimension"]
+    measure = view["measure"]
+    sheet = _xml_text(view["sheet"])
+    dimension_local = locals_by_column[dimension]
+    measure_local = locals_by_column[measure]
+    dimension_field = f"[federated.0].[none:{dimension_local}:nk]"
+    measure_field = f"[federated.0].[sum:{measure_local}:qk]"
+    mark, rows, cols, encodings = _mark_layout(view["chart"], dimension_field, measure_field)
+    dimension_ref = _xml_text(_bracket(dimension))
+    measure_ref = _xml_text(_bracket(measure))
+    chart_xml = "\n".join(
+        [
+            _column_xml(dimension, kinds[dimension]),
+            _column_xml(measure, kinds[measure]),
+            f"            <column-instance column='{dimension_ref}' derivation='None' name='[none:{dimension_local}:nk]' pivot='key' type='nominal' />",
+            f"            <column-instance column='{measure_ref}' derivation='Sum' name='[sum:{measure_local}:qk]' pivot='key' type='quantitative' />",
+        ]
+    )
+    rows_xml = f"<rows>{rows}</rows>" if rows else "<rows />"
+    cols_xml = f"<cols>{cols}</cols>" if cols else "<cols />"
+    encoding_xml = f"\n            {encodings}" if encodings else ""
+    return f"""    <worksheet name='{sheet}'>
       <table>
         <view>
           <datasources>
@@ -635,38 +795,71 @@ def _workbook_twb(name: str, columns: list, kinds: dict, view: dict, csv_name: s
             <view>
               <breakdown value='auto' />
             </view>
-            <mark class='{mark}' />
-            {encodings}
+            <mark class='{mark}' />{encoding_xml}
           </pane>
         </panes>
         {rows_xml}
         {cols_xml}
       </table>
-    </worksheet>
-  </worksheets>
-  <windows source-height='30'>
-    <window class='worksheet' maximized='true' name='{sheet}'>
-      <cards>
-        <edge name='left'>
-          <strip size='160'>
-            <card type='pages' />
-            <card type='filters' />
-            <card type='marks' />
-          </strip>
-        </edge>
-        <edge name='top'>
-          <strip size='31'>
-            <card type='columns' />
-          </strip>
-          <strip size='31'>
-            <card type='rows' />
-          </strip>
-        </edge>
-      </cards>
-    </window>
-  </windows>
-</workbook>
+    </worksheet>"""
+
+
+def _dashboards_xml(views: list) -> str:
+    title = _dashboard_name(views)
+    if title is None:
+        return ""
+    count = len(views)
+    columns = 2 if count > 1 else 1
+    grid_rows = (count + columns - 1) // columns
+    cell_w = 100000 // columns
+    cell_h = 100000 // grid_rows
+    zones = []
+    for index, view in enumerate(views):
+        sheet = _xml_text(view["sheet"])
+        x = (index % columns) * cell_w
+        y = (index // columns) * cell_h
+        zones.append(
+            f"          <zone h='{cell_h}' id='{index + 10}' name='{sheet}' w='{cell_w}' x='{x}' y='{y}' />"
+        )
+    zone_xml = "\n".join(zones)
+    safe_title = _xml_text(title)
+    return f"""  <dashboards>
+    <dashboard name='{safe_title}'>
+      <style />
+      <size maxheight='800' maxwidth='1200' minheight='800' minwidth='1200' />
+      <zones>
+        <zone h='100000' id='2' type='layout-basic' w='100000' x='0' y='0'>
+{zone_xml}
+        </zone>
+      </zones>
+    </dashboard>
+  </dashboards>
 """
+
+
+def _windows_xml(views: list) -> str:
+    title = _dashboard_name(views)
+    windows = []
+    if title is not None:
+        viewpoints = "\n".join(
+            f"      <viewpoint name='{_xml_text(view['sheet'])}' />" for view in views
+        )
+        windows.append(
+            f"""    <window class='dashboard' maximized='true' name='{_xml_text(title)}'>
+      <viewpoints>
+{viewpoints}
+      </viewpoints>
+      <active id='-1' />
+    </window>"""
+        )
+    for index, view in enumerate(views):
+        maximized = " maximized='true'" if title is None and index == 0 else ""
+        windows.append(
+            f"""    <window class='worksheet'{maximized} name='{_xml_text(view['sheet'])}'>
+{_WINDOW_CARDS}
+    </window>"""
+        )
+    return "\n".join(windows)
 
 
 def _mark_layout(chart: str, dimension_field: str, measure_field: str) -> tuple:
@@ -705,6 +898,21 @@ def _column_xml(name: str, kind: str) -> str:
 
 def _bracket(name: str) -> str:
     return "[" + name.replace("]", "]]") + "]"
+
+
+def _local_names(columns: list) -> dict:
+    used = set()
+    names = {}
+    for column in columns:
+        base = _local_name(column)
+        name = base
+        suffix = 2
+        while name in used:
+            name = f"{base}_{suffix}"
+            suffix += 1
+        used.add(name)
+        names[column] = name
+    return names
 
 
 def _local_name(name: str) -> str:
