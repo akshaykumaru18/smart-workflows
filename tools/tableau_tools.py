@@ -142,22 +142,27 @@ def get_view_pdf(session: dict, view_id: str, output_path: str) -> dict:
     return _download_view(session, view_id, "pdf", "application/pdf", output_path)
 
 
-def publish_sales_workbook(session: dict, name: str = "Dummy Sales", rows: list | None = None) -> dict:
-    """Publish dummy sales rows and a bar-chart workbook to the first Tableau project."""
+def publish_sales_workbook(session: dict, file_path: str, name: str | None = None) -> dict:
+    """Read a local CSV with the file tools and publish those rows as a Tableau workbook."""
+    from pathlib import Path
+
+    columns, rows, kinds = _load_user_csv(file_path)
+    dimension, measure = _chart_fields(columns, kinds)
+    workbook_name = (name or Path(file_path).stem).strip() or Path(file_path).stem
     projects = list_projects(session)
     if not projects:
         raise RuntimeError("Tableau site has no project to publish into")
     project = projects[0]
-    sales_rows = rows or DUMMY_SALES
-    hyper_path = _write_sales_hyper(sales_rows)
-    twbx_path = _write_sales_twbx(name, hyper_path)
+    slug = _file_slug(workbook_name)
+    hyper_path = _write_hyper(columns, kinds, rows, Path("reports") / f"{slug}.hyper")
+    twbx_path = _write_twbx(workbook_name, columns, kinds, dimension, measure, hyper_path)
     try:
         datasource = _publish_file(
             session,
             "datasources",
             "tableau_datasource",
             hyper_path,
-            _request_xml("datasource", name, project["id"]),
+            _request_xml("datasource", workbook_name, project["id"]),
             {"overwrite": "true", "datasourceType": "hyper"},
         )
         workbook = _publish_file(
@@ -165,15 +170,20 @@ def publish_sales_workbook(session: dict, name: str = "Dummy Sales", rows: list 
             "workbooks",
             "tableau_workbook",
             twbx_path,
-            _request_xml("workbook", name, project["id"]),
+            _request_xml("workbook", workbook_name, project["id"]),
             {"overwrite": "true"},
         )
     finally:
         hyper_path.unlink(missing_ok=True)
         twbx_path.unlink(missing_ok=True)
     return {
+        "source_file": file_path,
+        "name": workbook_name,
+        "columns": columns,
+        "dimension": dimension,
+        "measure": measure,
         "project": project,
-        "row_count": len(sales_rows),
+        "row_count": len(rows),
         "datasource": _datasource(datasource.get("datasource") or {}),
         "workbook": _workbook(workbook.get("workbook") or {}),
     }
@@ -281,14 +291,6 @@ def _job(item: dict) -> dict:
     }
 
 
-DUMMY_SALES = [
-    {"Region": "North", "Product": "Phone", "Sales": 1820.0, "Profit": 420.0},
-    {"Region": "South", "Product": "Laptop", "Sales": 3560.0, "Profit": 910.0},
-    {"Region": "East", "Product": "Tablet", "Sales": 980.0, "Profit": 160.0},
-    {"Region": "West", "Product": "Phone", "Sales": 2410.0, "Profit": 530.0},
-]
-
-
 def _paged(session: dict, path: str, collection_key: str, item_key: str, max_items: int = 1000) -> list:
     import requests
 
@@ -355,7 +357,82 @@ def _view(item: dict) -> dict:
     }
 
 
-def _write_sales_hyper(rows: list):
+def _load_user_csv(file_path: str) -> tuple:
+    """Read the user's CSV through the file tools and return columns, rows, and kinds."""
+    import csv
+    import io
+
+    from tools.file_tools import read_file
+
+    text = read_file(file_path)
+    if text.startswith("\ufeff"):
+        text = text[1:]
+    reader = csv.DictReader(io.StringIO(text))
+    if not reader.fieldnames:
+        raise ValueError(f"CSV has no header row: {file_path}")
+
+    columns = []
+    sources = []
+    for original in reader.fieldnames:
+        if original is None or not str(original).strip():
+            continue
+        name = str(original).strip()
+        if name in columns:
+            raise ValueError(f"Duplicate column: {name}")
+        columns.append(name)
+        sources.append(original)
+    if not columns:
+        raise ValueError(f"CSV has no columns: {file_path}")
+
+    rows = []
+    for raw in reader:
+        row = {name: (raw.get(source) or "").strip() for name, source in zip(columns, sources)}
+        if any(row.values()):
+            rows.append(row)
+    if not rows:
+        raise ValueError(f"CSV has no data rows: {file_path}")
+    return columns, rows, _column_kinds(columns, rows)
+
+
+def _column_kinds(columns: list, rows: list) -> dict:
+    kinds = {}
+    for name in columns:
+        numeric = True
+        seen = False
+        for row in rows:
+            value = row[name]
+            if value == "":
+                continue
+            seen = True
+            try:
+                float(value)
+            except ValueError:
+                numeric = False
+                break
+        kinds[name] = "number" if seen and numeric else "text"
+    return kinds
+
+
+def _chart_fields(columns: list, kinds: dict) -> tuple:
+    text = [name for name in columns if kinds[name] == "text"]
+    numbers = [name for name in columns if kinds[name] == "number"]
+    dimension = next((name for name in ("Region", "Category", "Product") if name in text), None)
+    if dimension is None and text:
+        dimension = text[0]
+    measure = next((name for name in ("Sales", "Profit") if name in numbers), None)
+    if measure is None and numbers:
+        measure = numbers[0]
+    if dimension is None or measure is None:
+        raise ValueError("CSV needs at least one text column and one numeric column")
+    return dimension, measure
+
+
+def _file_slug(name: str) -> str:
+    slug = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in name).strip("_")
+    return slug or "workbook"
+
+
+def _write_hyper(columns: list, kinds: dict, rows: list, hyper_path):
     from pathlib import Path
     from tableauhyperapi import (
         Connection,
@@ -368,47 +445,70 @@ def _write_sales_hyper(rows: list):
         Telemetry,
     )
 
-    path = Path("reports") / "dummy_sales.hyper"
+    path = Path(hyper_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     table = TableDefinition(
         table_name=TableName("Extract", "Extract"),
         columns=[
-            TableDefinition.Column("Region", SqlType.text()),
-            TableDefinition.Column("Product", SqlType.text()),
-            TableDefinition.Column("Sales", SqlType.double()),
-            TableDefinition.Column("Profit", SqlType.double()),
+            TableDefinition.Column(
+                name,
+                SqlType.double() if kinds[name] == "number" else SqlType.text(),
+            )
+            for name in columns
         ],
     )
     with HyperProcess(telemetry=Telemetry.DO_NOT_SEND_USAGE_DATA_TO_TABLEAU) as hyper:
-        with Connection(endpoint=hyper.endpoint, database=str(path), create_mode=CreateMode.CREATE_AND_REPLACE) as connection:
+        with Connection(
+            endpoint=hyper.endpoint,
+            database=str(path),
+            create_mode=CreateMode.CREATE_AND_REPLACE,
+        ) as connection:
             connection.catalog.create_schema("Extract")
             connection.catalog.create_table(table)
             with Inserter(connection, table) as inserter:
                 inserter.add_rows(
-                    [[row["Region"], row["Product"], float(row["Sales"]), float(row["Profit"])] for row in rows]
+                    [[_hyper_value(kinds[name], row[name]) for name in columns] for row in rows]
                 )
                 inserter.execute()
     return path
 
 
-def _write_sales_twbx(name: str, hyper_path) -> "Path":
+def _hyper_value(kind: str, value: str):
+    if value == "":
+        return None
+    if kind == "number":
+        return float(value)
+    return value
+
+
+def _write_twbx(name: str, columns: list, kinds: dict, dimension: str, measure: str, hyper_path):
     import zipfile
     from pathlib import Path
 
-    twbx_path = Path("reports") / "dummy_sales.twbx"
-    twb = _sales_twb(name)
+    hyper_name = Path(hyper_path).name
+    twbx_path = Path(hyper_path).with_suffix(".twbx")
+    twb = _workbook_twb(name, columns, kinds, dimension, measure, hyper_name)
     with zipfile.ZipFile(twbx_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr("dummy_sales.twb", twb)
-        archive.write(hyper_path, "Data/dummy_sales.hyper")
+        archive.writestr(Path(hyper_path).with_suffix(".twb").name, twb)
+        archive.write(hyper_path, f"Data/{hyper_name}")
     return twbx_path
 
 
-def _sales_twb(name: str) -> str:
-    caption = (
-        name.replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-        .replace('"', "&quot;")
+def _workbook_twb(name: str, columns: list, kinds: dict, dimension: str, measure: str, hyper_name: str) -> str:
+    caption = _xml_text(name)
+    sheet = _xml_text(f"{measure} by {dimension}")
+    dimension_ref = _xml_text(_bracket(dimension))
+    measure_ref = _xml_text(_bracket(measure))
+    dimension_local = _local_name(dimension)
+    measure_local = _local_name(measure)
+    column_xml = "\n".join(_column_xml(column, kinds[column]) for column in columns)
+    chart_xml = "\n".join(
+        [
+            _column_xml(dimension, kinds[dimension]),
+            _column_xml(measure, kinds[measure]),
+            f"            <column-instance column='{dimension_ref}' derivation='None' name='[none:{dimension_local}:nk]' pivot='key' type='nominal' />",
+            f"            <column-instance column='{measure_ref}' derivation='Sum' name='[sum:{measure_local}:qk]' pivot='key' type='quantitative' />",
+        ]
     )
     return f"""<?xml version='1.0' encoding='utf-8' ?>
 <workbook source-build='2024.2.0' source-platform='mac' version='18.1' xmlns:user='http://www.tableausoftware.com/xml/user'>
@@ -418,29 +518,23 @@ def _sales_twb(name: str) -> str:
       <connection class='federated'>
         <named-connections>
           <named-connection caption='{caption}' name='hyper.0'>
-            <connection authentication='auth-none' class='hyper' dbname='Data/dummy_sales.hyper' schema='Extract' tablename='Extract' />
+            <connection authentication='auth-none' class='hyper' dbname='Data/{_xml_text(hyper_name)}' schema='Extract' tablename='Extract' />
           </named-connection>
         </named-connections>
         <relation connection='hyper.0' name='Extract' table='[Extract].[Extract]' type='table' />
       </connection>
-      <column datatype='string' name='[Region]' role='dimension' type='nominal' />
-      <column datatype='string' name='[Product]' role='dimension' type='nominal' />
-      <column datatype='real' name='[Sales]' role='measure' type='quantitative' />
-      <column datatype='real' name='[Profit]' role='measure' type='quantitative' />
+{column_xml}
     </datasource>
   </datasources>
   <worksheets>
-    <worksheet name='Sales by Region'>
+    <worksheet name='{sheet}'>
       <table>
         <view>
           <datasources>
             <datasource caption='{caption}' name='federated.0' />
           </datasources>
           <datasource-dependencies datasource='federated.0'>
-            <column datatype='string' name='[Region]' role='dimension' type='nominal' />
-            <column datatype='real' name='[Sales]' role='measure' type='quantitative' />
-            <column-instance column='[Region]' derivation='None' name='[none:Region:nk]' pivot='key' type='nominal' />
-            <column-instance column='[Sales]' derivation='Sum' name='[sum:Sales:qk]' pivot='key' type='quantitative' />
+{chart_xml}
           </datasource-dependencies>
           <aggregation value='true' />
         </view>
@@ -453,13 +547,13 @@ def _sales_twb(name: str) -> str:
             <mark class='Bar' />
           </pane>
         </panes>
-        <rows>[federated.0].[sum:Sales:qk]</rows>
-        <cols>[federated.0].[none:Region:nk]</cols>
+        <rows>[federated.0].[sum:{measure_local}:qk]</rows>
+        <cols>[federated.0].[none:{dimension_local}:nk]</cols>
       </table>
     </worksheet>
   </worksheets>
   <windows source-height='30'>
-    <window class='worksheet' maximized='true' name='Sales by Region'>
+    <window class='worksheet' maximized='true' name='{sheet}'>
       <cards>
         <edge name='left'>
           <strip size='160'>
@@ -481,6 +575,37 @@ def _sales_twb(name: str) -> str:
   </windows>
 </workbook>
 """
+
+
+def _column_xml(name: str, kind: str) -> str:
+    if kind == "number":
+        datatype, role, semantic = "real", "measure", "quantitative"
+    else:
+        datatype, role, semantic = "string", "dimension", "nominal"
+    return (
+        f"      <column datatype='{datatype}' name='{_xml_text(_bracket(name))}' "
+        f"role='{role}' type='{semantic}' />"
+    )
+
+
+def _bracket(name: str) -> str:
+    return "[" + name.replace("]", "]]") + "]"
+
+
+def _local_name(name: str) -> str:
+    cleaned = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in name)
+    return cleaned or "Field"
+
+
+def _xml_text(value: str) -> str:
+    return (
+        str(value)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&apos;")
+    )
 
 
 def _request_xml(kind: str, name: str, project_id: str) -> str:

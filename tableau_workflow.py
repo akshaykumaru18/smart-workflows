@@ -70,7 +70,6 @@ def tool_catalog() -> str:
         lines.append(f"- {name}{inspect.signature(function)}: {description}")
     return "\n".join(lines)
 
-
 def parse_json(text: str) -> dict:
     cleaned = text.strip()
     if cleaned.startswith("```"):
@@ -105,9 +104,9 @@ def gemini_tool(user_prompt: str) -> str:
             response_mime_type="application/json",
         ),
     )
-    print("--------------------------------")
-    print(response.usage_metadata)
-    print("--------------------------------")
+    # print("--------------------------------")
+    # print(response.usage_metadata)
+    # print("--------------------------------")
     message_history.append({"role": "model", "parts": [{"text": response.text}]})
     return response.text
 
@@ -198,11 +197,14 @@ def run():
             """List Tableau projects. No arguments."""
             return list_projects(session)
 
-        def publish_sales(name: str = "Dummy Sales") -> dict:
-            """Publish dummy sales data and a Sales by Region bar chart. Optional argument: name."""
-            result = publish_sales_workbook(session, name)
+        def publish_sales(file_path: str, name: str | None = None) -> dict:
+            """Read a local CSV through the file tools and publish those rows with a bar chart. Arguments: file_path, optional name."""
+            result = publish_sales_workbook(session, file_path, name)
             workbook = result.get("workbook") or {}
-            print(f"Published {name} to Tableau: {workbook.get('webpage_url') or workbook.get('id')}")
+            print(
+                f"Published {result.get('name')} ({result.get('row_count')} rows from {file_path}) "
+                f"to Tableau: {workbook.get('webpage_url') or workbook.get('id')}"
+            )
             return result
 
         tools = {
@@ -245,9 +247,10 @@ You can call only the tools listed below. Call one tool at a time.
 - refresh_workbook(workbook_id): reload the extract for an existing workbook. List workbooks first and use an id from that result.
 - refresh_datasource(datasource_id): reload the extract for an existing data source. List data sources first and use an id from that result.
 - get_job(job_id): check the refresh job returned by a refresh tool.
-- publish_sales_workbook(name): publish four dummy sales rows and a Sales by Region bar chart. name is optional.
+- publish_sales_workbook(file_path, name): read the user's CSV through the file tools and publish those rows with a bar chart. name is optional.
 
-A refresh reloads an existing extract. publish_sales_workbook is the tool that adds new sales data and the chart.
+A refresh reloads an existing extract. It does not add the user's rows.
+When the user wants their own data in Tableau, call read_file on the file path they gave, then call publish_sales_workbook with that same file_path. The publish tool reads the file through the file tools and builds the extract and chart from those rows. Do not invent rows.
 Use a file tool when the question asks to read or change a local file.
 
 Reply with only this JSON object:
@@ -308,9 +311,11 @@ Tool signatures:
                         f"User question: {user_question}\n"
                         f"Required data: {json.dumps(snapshot, default=str)}\n"
                         "Continue the tool sequence. Read or write files when still needed. "
+                        "If this result is the user's file and they want it in Tableau, call "
+                        "publish_sales_workbook with that file path. Do not paste rows into the tool. "
                         "When the requested Tableau work is done, answer in valid JSON "
                         "with data_needed=false, data=null, reprompt=false, "
-                        "and response copying names, ids, and job status from the tool result."
+                        "and response copying names, ids, row counts, and job status from the tool result."
                     )
             except (json.JSONDecodeError, KeyError) as error:
                 print(f"Invalid response: {error}")
