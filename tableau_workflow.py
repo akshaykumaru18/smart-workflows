@@ -14,10 +14,7 @@ Export these before running:
     python tableau_workflow.py
 
 TABLEAU_API_VERSION defaults to 3.29.
-TABLEAU_SCOPES defaults to tableau:content:read,tableau:tasks:run,tableau:views:download.
-Publishing a workbook also needs tableau:datasources:create and tableau:workbooks:create
-enabled on the connected app and included in TABLEAU_SCOPES.
-Image and PDF download need tableau:views:download on the connected app.
+Sign-in always sends the scopes in SCOPES below. The connected app must allow each one.
 """
 
 import inspect
@@ -57,6 +54,12 @@ except ImportError:
 
 MODEL = "gemini-flash-lite-latest"
 MAX_TOOL_CALLS = 8
+SCOPES = [
+    "tableau:content:read",
+    "tableau:tasks:run",
+    "tableau:views:download",
+    "tableau:workbooks:create",
+]
 
 message_history = []
 client = None
@@ -136,14 +139,6 @@ def run():
         print("Missing environment variables: " + ", ".join(missing))
         return
 
-    scopes = [
-        scope.strip()
-        for scope in os.getenv(
-            "TABLEAU_SCOPES",
-            "tableau:content:read,tableau:tasks:run,tableau:views:download",
-        ).split(",")
-        if scope.strip()
-    ]
     session = sign_in(
         os.environ["TABLEAU_SERVER"],
         os.environ["TABLEAU_SITE_CONTENT_URL"],
@@ -152,8 +147,9 @@ def run():
         os.environ["TABLEAU_SECRET_VALUE"],
         os.environ["TABLEAU_USERNAME"],
         os.getenv("TABLEAU_API_VERSION", "3.29"),
-        scopes,
+        SCOPES,
     )
+    print("Tableau scopes: " + ", ".join(SCOPES))
     print(f"Signed in to Tableau site {session['site_id']}")
 
     try:
@@ -270,6 +266,7 @@ When the user wants their own data in Tableau, call read_file on the file path t
 - Use chart="circle" for a scatter plot and chart="square" for a square mark.
 - Set dimension to the text column that answers the question, and measure to the numeric column. Do not use Region and Sales unless the question is about those columns. If they name no columns, choose a category column and a numeric column that exist in the file and say which ones you used.
 Then call publish_sales_workbook with that file_path, chart, dimension, and measure. Do not invent rows.
+Never create a sample, dummy, or substitute file. If a tool returns an error, copy that error into the response and stop.
 For an image or PDF, call get_view_image or get_view_pdf with a view id returned by publish or list_views. If the publish result has no views, call list_views with the new workbook id.
 Use a file tool when the question asks to read or change a local file.
 
@@ -332,7 +329,8 @@ Tool signatures:
                         "dimension, and measure from the question and these columns, then call "
                         "publish_sales_workbook with that file path. Do not paste rows into the tool. "
                         "If they asked for an image or PDF, call get_view_image or get_view_pdf with a view id. "
-                        "If the tool returned an error, correct the arguments and try again. "
+                        "If the tool returned an error, correct the arguments only when they were wrong. "
+                        "Do not create a sample or dummy file. "
                         "When the requested Tableau work is done, answer in valid JSON "
                         "with data_needed=false, data=null, reprompt=false, "
                         "and response copying names, ids, chart, row counts, file paths, and job status from the tool result."

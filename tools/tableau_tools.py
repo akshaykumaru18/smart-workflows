@@ -1,7 +1,12 @@
 import time
 import uuid
 
-_DEFAULT_SCOPES = ["tableau:content:read", "tableau:tasks:run", "tableau:views:download"]
+_DEFAULT_SCOPES = [
+    "tableau:content:read",
+    "tableau:tasks:run",
+    "tableau:views:download",
+    "tableau:workbooks:create",
+]
 
 
 def generate_jwt(
@@ -184,17 +189,8 @@ def publish_sales_workbook(
         raise RuntimeError("Tableau site has no project to publish into")
     project = projects[0]
     slug = _file_slug(workbook_name)
-    hyper_path = _write_hyper(columns, kinds, rows, Path("reports") / f"{slug}.hyper")
-    twbx_path = _write_twbx(workbook_name, columns, kinds, view, hyper_path)
+    twbx_path, csv_path = _write_twbx(workbook_name, columns, kinds, rows, view, Path("reports") / f"{slug}.csv")
     try:
-        datasource = _publish_file(
-            session,
-            "datasources",
-            "tableau_datasource",
-            hyper_path,
-            _request_xml("datasource", workbook_name, project["id"]),
-            {"overwrite": "true", "datasourceType": "hyper"},
-        )
         workbook = _publish_file(
             session,
             "workbooks",
@@ -204,7 +200,7 @@ def publish_sales_workbook(
             {"overwrite": "true"},
         )
     finally:
-        hyper_path.unlink(missing_ok=True)
+        csv_path.unlink(missing_ok=True)
         twbx_path.unlink(missing_ok=True)
     published = _workbook(workbook.get("workbook") or {})
     return {
@@ -217,7 +213,6 @@ def publish_sales_workbook(
         "sheet": view["sheet"],
         "project": project,
         "row_count": len(rows),
-        "datasource": _datasource(datasource.get("datasource") or {}),
         "workbook": published,
         "views": published.get("views") or [],
     }
@@ -549,69 +544,34 @@ def _file_slug(name: str) -> str:
     return slug or "workbook"
 
 
-def _write_hyper(columns: list, kinds: dict, rows: list, hyper_path):
+def _write_csv(columns: list, rows: list, csv_path):
+    import csv
     from pathlib import Path
-    from tableauhyperapi import (
-        Connection,
-        CreateMode,
-        HyperProcess,
-        Inserter,
-        SqlType,
-        TableDefinition,
-        TableName,
-        Telemetry,
-    )
 
-    path = Path(hyper_path)
+    path = Path(csv_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    table = TableDefinition(
-        table_name=TableName("Extract", "Extract"),
-        columns=[
-            TableDefinition.Column(
-                name,
-                SqlType.double() if kinds[name] == "number" else SqlType.text(),
-            )
-            for name in columns
-        ],
-    )
-    with HyperProcess(telemetry=Telemetry.DO_NOT_SEND_USAGE_DATA_TO_TABLEAU) as hyper:
-        with Connection(
-            endpoint=hyper.endpoint,
-            database=str(path),
-            create_mode=CreateMode.CREATE_AND_REPLACE,
-        ) as connection:
-            connection.catalog.create_schema("Extract")
-            connection.catalog.create_table(table)
-            with Inserter(connection, table) as inserter:
-                inserter.add_rows(
-                    [[_hyper_value(kinds[name], row[name]) for name in columns] for row in rows]
-                )
-                inserter.execute()
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
     return path
 
 
-def _hyper_value(kind: str, value: str):
-    if value == "":
-        return None
-    if kind == "number":
-        return float(value)
-    return value
-
-
-def _write_twbx(name: str, columns: list, kinds: dict, view: dict, hyper_path):
+def _write_twbx(name: str, columns: list, kinds: dict, rows: list, view: dict, csv_path):
     import zipfile
     from pathlib import Path
 
-    hyper_name = Path(hyper_path).name
-    twbx_path = Path(hyper_path).with_suffix(".twbx")
-    twb = _workbook_twb(name, columns, kinds, view, hyper_name)
+    csv_file = _write_csv(columns, rows, csv_path)
+    csv_name = Path(csv_file).name
+    twbx_path = Path(csv_file).with_suffix(".twbx")
+    twb = _workbook_twb(name, columns, kinds, view, csv_name)
     with zipfile.ZipFile(twbx_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr(Path(hyper_path).with_suffix(".twb").name, twb)
-        archive.write(hyper_path, f"Data/{hyper_name}")
-    return twbx_path
+        archive.writestr(Path(csv_file).with_suffix(".twb").name, twb)
+        archive.write(csv_file, f"Data/{csv_name}")
+    return twbx_path, csv_file
 
 
-def _workbook_twb(name: str, columns: list, kinds: dict, view: dict, hyper_name: str) -> str:
+def _workbook_twb(name: str, columns: list, kinds: dict, view: dict, csv_name: str) -> str:
     dimension = view["dimension"]
     measure = view["measure"]
     caption = _xml_text(name)
@@ -624,6 +584,9 @@ def _workbook_twb(name: str, columns: list, kinds: dict, view: dict, hyper_name:
     measure_field = f"[federated.0].[sum:{measure_local}:qk]"
     mark, rows, cols, encodings = _mark_layout(view["chart"], dimension_field, measure_field)
     column_xml = "\n".join(_column_xml(column, kinds[column]) for column in columns)
+    relation_columns = "\n".join(_relation_column(column, kinds[column], index) for index, column in enumerate(columns))
+    table_name = _xml_text("[" + csv_name.replace(".", "#") + "]")
+    csv_xml = _xml_text(csv_name)
     chart_xml = "\n".join(
         [
             _column_xml(dimension, kinds[dimension]),
@@ -641,11 +604,15 @@ def _workbook_twb(name: str, columns: list, kinds: dict, view: dict, hyper_name:
     <datasource caption='{caption}' inline='true' name='federated.0' version='18.1'>
       <connection class='federated'>
         <named-connections>
-          <named-connection caption='{caption}' name='hyper.0'>
-            <connection authentication='auth-none' class='hyper' dbname='Data/{_xml_text(hyper_name)}' schema='Extract' tablename='Extract' />
+          <named-connection caption='{caption}' name='textscan.0'>
+            <connection class='textscan' directory='Data' filename='{csv_xml}' password='' server='' />
           </named-connection>
         </named-connections>
-        <relation connection='hyper.0' name='Extract' table='[Extract].[Extract]' type='table' />
+        <relation connection='textscan.0' name='{csv_xml}' table='{table_name}' type='table'>
+          <columns header='yes' outcome='6'>
+{relation_columns}
+          </columns>
+        </relation>
       </connection>
 {column_xml}
     </datasource>
@@ -718,6 +685,11 @@ def _mark_layout(chart: str, dimension_field: str, measure_field: str) -> tuple:
         return "Pie", "", "", encodings
     marks = {"bar": "Bar", "line": "Line", "area": "Area", "circle": "Circle", "square": "Square"}
     return marks[chart], measure_field, dimension_field, ""
+
+
+def _relation_column(name: str, kind: str, index: int) -> str:
+    datatype = "real" if kind == "number" else "string"
+    return f"            <column datatype='{datatype}' name='{_xml_text(name)}' ordinal='{index}' />"
 
 
 def _column_xml(name: str, kind: str) -> str:
