@@ -88,7 +88,7 @@ def list_workbooks(session: dict, max_items: int = 1000) -> list:
     return [_workbook(item) for item in items]
 
 
-def list_views(session: dict, workbook_id: str | None = None, max_items: int = 1000) -> list:
+def list_views(session: dict, workbook_id: str | None = None, max_items: int = 10) -> list:
     """Return views on the site. Pass workbook_id to keep one workbook."""
     items = _paged(session, "/views", "views", "view", max_items=max_items)
     if workbook_id:
