@@ -1,0 +1,5 @@
+INSERT INTO customers (first_name, last_name, email) VALUES ('John', 'Doe', 'john.doe@example.com');
+INSERT INTO products (sku, product_name, unit_price) VALUES ('SKU123', 'Product A', 10.00);
+INSERT INTO sales_orders (order_number, customer_id, total_amount) VALUES ('ORD001', 1, 10.00);
+INSERT INTO order_items (order_id, product_id, quantity, unit_price) VALUES (1, 1, 1, 10.00);
+INSERT INTO payments (order_id, amount, payment_method, payment_status) VALUES (1, 10.00, 'card', 'completed');
