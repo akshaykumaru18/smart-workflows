@@ -1,0 +1,4 @@
+discount_id,order_id,discount_date,discount_percent
+D1,1,2023-01-01,10
+D2,2,2023-01-05,15
+D3,3,2023-01-10,5
