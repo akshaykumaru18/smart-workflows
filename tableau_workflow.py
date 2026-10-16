@@ -204,14 +204,15 @@ def run():
             dimension: str | None = None,
             measure: str | None = None,
         ) -> dict:
-            """Publish a local CSV as a table or the requested chart. Arguments: file_path, optional name, chart, dimension, measure."""
+            """Publish a CSV. Leave chart, dimension, and measure empty so sheets are built from that file's columns. Arguments: file_path, optional name, chart, dimension, measure."""
             result = publish_sales_workbook(session, file_path, name, chart, dimension, measure)
             workbook = result.get("workbook") or {}
+            sheet_names = ", ".join(sheet["sheet"] for sheet in result.get("sheets") or [])
             print(
-                f"Published {result.get('name')} as {result.get('chart')} of "
-                f"{result.get('measure')} by {result.get('dimension')} "
-                f"({result.get('row_count')} rows from {file_path}) "
-                f"to Tableau: {workbook.get('webpage_url') or workbook.get('id')}"
+                f"Published {result.get('name')} ({result.get('row_count')} rows from {file_path}) "
+                f"with sheets: {sheet_names}. "
+                f"Dashboard: {result.get('dashboard') or 'none'}. "
+                f"Tableau: {workbook.get('webpage_url') or workbook.get('id')}"
             )
             return result
 
@@ -255,17 +256,10 @@ You can call only the tools listed below. Call one tool at a time.
 - refresh_workbook(workbook_id): reload the extract for an existing workbook. List workbooks first and use an id from that result.
 - refresh_datasource(datasource_id): reload the extract for an existing data source. List data sources first and use an id from that result.
 - get_job(job_id): check the refresh job returned by a refresh tool.
-- publish_sales_workbook(file_path, name, chart, dimension, measure): read the user's CSV through the file tools and publish it. name is optional.
+- publish_sales_workbook(file_path, name): read the user's CSV and publish a workbook whose sheets come from the columns in that file. name is optional. Leave chart, dimension, and measure empty.
 
 A refresh reloads an existing extract. It does not add the user's rows.
-When the user wants their own data in Tableau, call read_file on the file path they gave. Then choose the view from that file and the question:
-- Use chart="table" when they ask to publish, load, or see the data and do not ask for a chart.
-- Use chart="bar" or "horizontal_bar" when they ask for a bar chart or a comparison across categories.
-- Use chart="line" or "area" when they ask for a trend over time.
-- Use chart="pie" when they ask for a pie chart or a share of a whole.
-- Use chart="circle" for a scatter plot and chart="square" for a square mark.
-- Set dimension to the text column that answers the question, and measure to the numeric column. Do not use Region and Sales unless the question is about those columns. If they name no columns, choose a category column and a numeric column that exist in the file and say which ones you used.
-Then call publish_sales_workbook with that file_path, chart, dimension, and measure. Do not invent rows.
+When the user wants their own data in Tableau, call read_file on the file path they gave, then call publish_sales_workbook with that file_path only. The tool reads the header and values and builds the sheets: a bar for each numeric column by the file's categories, and a line for each numeric column over a date column when the file has one. Different files produce different sheets. Pass chart, dimension, and measure only when the user names a chart and those exact column names appear in the file you just read. Do not invent rows or column names.
 Never create a sample, dummy, or substitute file. If a tool returns an error, copy that error into the response and stop.
 For an image or PDF, call get_view_image or get_view_pdf with a view id returned by publish or list_views. If the publish result has no views, call list_views with the new workbook id.
 Use a file tool when the question asks to read or change a local file.
@@ -325,15 +319,16 @@ Tool signatures:
                         f"User question: {user_question}\n"
                         f"Required data: {json.dumps(snapshot, default=str)}\n"
                         "Continue the tool sequence. Read or write files when still needed. "
-                        "If this result is the user's file and they want it in Tableau, choose chart, "
-                        "dimension, and measure from the question and these columns, then call "
-                        "publish_sales_workbook with that file path. Do not paste rows into the tool. "
+                        "If this result is the user's file and they want it in Tableau, call "
+                        "publish_sales_workbook with that file path only. Leave chart, dimension, and "
+                        "measure empty so the sheets follow the columns in the file. "
+                        "Do not paste rows into the tool. "
                         "If they asked for an image or PDF, call get_view_image or get_view_pdf with a view id. "
                         "If the tool returned an error, correct the arguments only when they were wrong. "
                         "Do not create a sample or dummy file. "
                         "When the requested Tableau work is done, answer in valid JSON "
                         "with data_needed=false, data=null, reprompt=false, "
-                        "and response copying names, ids, chart, row counts, file paths, and job status from the tool result."
+                        "and response copying names, ids, sheets, dashboard, row counts, file paths, and job status from the tool result."
                     )
             except (json.JSONDecodeError, KeyError) as error:
                 print(f"Invalid response: {error}")
