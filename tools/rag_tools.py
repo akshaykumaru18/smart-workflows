@@ -2,11 +2,8 @@
 
 Set GEMINI_API_KEY before calling build_retriever or answer_question.
 
-Google embeddings are sent in small batches and retried after a rate limit.
-If the quota is exhausted, embed on this machine instead:
-
-    export RAG_EMBEDDING_PROVIDER=local
-    pip install sentence-transformers
+Chunks are embedded on this machine with fastembed. The model and its
+cache folder are set in this file. Chat answers still use Gemini.
 """
 
 import os
@@ -31,8 +28,9 @@ if load_dotenv is not None:
     load_dotenv()
 
 CHAT_MODEL = os.environ.get("RAG_CHAT_MODEL", "gemini-flash-lite-latest")
-EMBEDDING_PROVIDER = os.environ.get("RAG_EMBEDDING_PROVIDER", "google").strip().lower()
-EMBEDDING_MODEL = os.environ.get("RAG_EMBEDDING_MODEL", "gemini-embedding-001")
+EMBEDDING_PROVIDER = "local"
+EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
+EMBEDDING_CACHE = Path.home() / ".fastembed"
 EMBEDDING_BATCH_SIZE = 5
 EMBEDDING_BATCH_PAUSE = 2.0
 CHUNK_SIZE = 800
@@ -215,7 +213,7 @@ def _vector_store(chunks: list[Document]) -> InMemoryVectorStore:
 def _embeddings():
     provider = EMBEDDING_PROVIDER
     if provider == "local":
-        return LocalEmbeddings(_local_model_name())
+        return LocalEmbeddings(EMBEDDING_MODEL, EMBEDDING_CACHE)
     if provider != "google":
         raise ValueError("RAG_EMBEDDING_PROVIDER must be google or local")
     # Leave task_type unset so documents use RETRIEVAL_DOCUMENT and
@@ -246,58 +244,31 @@ class PacedGoogleEmbeddings(GoogleGenerativeAIEmbeddings):
 
 
 class LocalEmbeddings:
-    """Embeddings from a sentence-transformers model on this machine."""
+    """Embeddings from a fastembed model stored in a short cache folder."""
 
-    def __init__(self, model_name: str):
+    def __init__(self, model_name: str, cache_dir: Path):
         try:
-            from sentence_transformers import SentenceTransformer
+            from fastembed import TextEmbedding
         except ImportError as error:
             raise RuntimeError(
-                "Local embeddings need sentence-transformers. "
-                "Install it with: pip install sentence-transformers"
+                "Local embeddings need fastembed. Install it with: pip install fastembed"
             ) from error
         print(f"Loading local embedding model {model_name}", flush=True)
-        self.model = SentenceTransformer(model_name)
+        self.model = TextEmbedding(model_name=model_name, cache_dir=str(cache_dir))
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        vectors = self.model.encode(
-            list(texts),
-            normalize_embeddings=True,
-            show_progress_bar=False,
-        )
-        return [vector.tolist() for vector in vectors]
+        return [vector.tolist() for vector in self.model.passage_embed(list(texts))]
 
     def embed_query(self, text: str) -> list[float]:
-        return self.embed_documents([text])[0]
-
-
-def _local_model_name() -> str:
-    configured = os.environ.get("RAG_EMBEDDING_MODEL", "").strip()
-    if not configured or configured.startswith("gemini-") or configured.startswith("models/"):
-        return "all-MiniLM-L6-v2"
-    return configured
+        return next(self.model.query_embed(text)).tolist()
 
 
 def _batch_size() -> int:
-    raw = os.environ.get("RAG_EMBEDDING_BATCH_SIZE", str(EMBEDDING_BATCH_SIZE))
-    try:
-        size = int(raw)
-    except ValueError as error:
-        raise ValueError("RAG_EMBEDDING_BATCH_SIZE must be a positive integer") from error
-    if size <= 0:
-        raise ValueError("RAG_EMBEDDING_BATCH_SIZE must be a positive integer")
-    return size
+    return EMBEDDING_BATCH_SIZE
 
 
 def _batch_pause() -> float:
-    raw = os.environ.get("RAG_EMBEDDING_BATCH_PAUSE", str(EMBEDDING_BATCH_PAUSE))
-    try:
-        pause = float(raw)
-    except ValueError as error:
-        raise ValueError("RAG_EMBEDDING_BATCH_PAUSE must be a number of seconds") from error
-    if pause < 0:
-        raise ValueError("RAG_EMBEDDING_BATCH_PAUSE must be >= 0")
-    return pause
+    return EMBEDDING_BATCH_PAUSE
 
 
 def _embed_in_batches(embed_batch, texts: list[str], size: int) -> list[list[float]]:

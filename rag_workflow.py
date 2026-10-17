@@ -61,7 +61,7 @@ def _index(file_path: str):
         f"Indexed {indexed.path}: {len(indexed.documents)} documents, "
         f"{len(indexed.chunks)} chunks."
     )
-    indexed.print_stored_embeddings()
+    # indexed.print_stored_embeddings()
     return indexed
 
 

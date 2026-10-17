@@ -6,8 +6,8 @@ Ask questions about one CSV, PDF, or text file. The file is split into chunks, e
 
 The retriever is **dense top-k similarity search**.
 
-1. Every chunk is embedded with `gemini-embedding-001` using the `RETRIEVAL_DOCUMENT` task.
-2. The question is embedded with the same model using the `RETRIEVAL_QUERY` task.
+1. Every chunk is embedded on this machine with fastembed model `BAAI/bge-small-en-v1.5`.
+2. The question is embedded with the same model.
 3. Chunks live in LangChain's `InMemoryVectorStore`, which ranks them by **cosine similarity**.
 4. `as_retriever(search_kwargs={"k": 4})` uses LangChain's default `search_type="similarity"` and returns the **4 closest chunks**.
 5. If the question names the abstract, introduction, conclusion, or references, those heading chunks are used instead of the similarity result. A request to explain that section in simpler words is answered from those chunks.
@@ -18,13 +18,13 @@ Those chunks are placed into one prompt. The chat model answers from that text o
 | --- | --- |
 | Search | similarity, top 4 |
 | Score | cosine similarity |
-| Embeddings | `gemini-embedding-001`, batches of 5 with a 2 second pause |
+| Embeddings | fastembed `BAAI/bge-small-en-v1.5`, cached in `~/.fastembed` |
 | Vector store | in memory, rebuilt each time a file is indexed |
 | Chunk size | 800 characters |
 | Chunk overlap | 120 characters |
 | Chat model | `gemini-flash-lite-latest`, temperature 0 |
 
-`k`, chunk size, and chunk overlap are arguments of `index_file` in `tools/rag_tools.py`. `RAG_CHAT_MODEL` and `RAG_EMBEDDING_MODEL` override the model names. `RAG_EMBEDDING_BATCH_SIZE` and `RAG_EMBEDDING_BATCH_PAUSE` slow Google embedding calls down. `RAG_EMBEDDING_PROVIDER=local` uses `all-MiniLM-L6-v2` on this machine instead of the Google quota (`pip install sentence-transformers`).
+`k`, chunk size, and chunk overlap are arguments of `index_file` in `tools/rag_tools.py`. The embedding model and cache folder are constants in that file. `RAG_CHAT_MODEL` overrides the chat model name.
 
 ## Run it
 
