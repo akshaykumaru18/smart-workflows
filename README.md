@@ -63,7 +63,7 @@ With no path, the program asks for one. At the `Question:` prompt:
 
 Empty documents are dropped. Any other extension raises an error.
 
-**Chunk.** `RecursiveCharacterTextSplitter` splits on paragraphs, lines, spaces, then characters, keeping 120 characters of overlap. Each chunk is numbered in `metadata["chunk"]`. A short CSV row stays one chunk. A long PDF page becomes several.
+**Chunk.** A CSV is grouped into chunks of 30 rows. Other files use `RecursiveCharacterTextSplitter`, which splits on paragraphs, lines, spaces, then characters, keeping 120 characters of overlap. Each chunk is numbered in `metadata["chunk"]`. A long PDF page becomes several.
 
 **Retrieve and answer.** `build_retriever` embeds the chunks and returns the similarity retriever. `IndexedFile.answer` retrieves the top 4 chunks, sends them to Gemini, and returns the answer plus those chunks as sources. The workflow prints the answer and a short preview of each source.
 

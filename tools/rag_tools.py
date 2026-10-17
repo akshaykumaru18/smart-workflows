@@ -35,6 +35,7 @@ EMBEDDING_BATCH_SIZE = 5
 EMBEDDING_BATCH_PAUSE = 2.0
 CHUNK_SIZE = 800
 CHUNK_OVERLAP = 120
+CSV_ROWS_PER_CHUNK = 30
 RETRIEVAL_K = 4
 NOT_FOUND = "I cannot find that in the document."
 
@@ -91,18 +92,26 @@ def chunk_documents(
     chunk_size: int = CHUNK_SIZE,
     chunk_overlap: int = CHUNK_OVERLAP,
 ) -> list[Document]:
-    """Split documents into overlapping chunks and number each chunk."""
-    if chunk_size <= 0:
-        raise ValueError("chunk_size must be greater than 0")
-    if chunk_overlap < 0 or chunk_overlap >= chunk_size:
-        raise ValueError("chunk_overlap must be >= 0 and smaller than chunk_size")
+    """Split documents into chunks and number each chunk.
 
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap,
-    )
-    chunks = splitter.split_documents(documents)
-    chunks = [chunk for chunk in chunks if chunk.page_content.strip()]
+    A CSV is grouped into chunks of 30 rows. Other files are split by
+    character size with overlap.
+    """
+    if _is_csv(documents):
+        chunks = _group_csv_rows(documents, CSV_ROWS_PER_CHUNK)
+    else:
+        if chunk_size <= 0:
+            raise ValueError("chunk_size must be greater than 0")
+        if chunk_overlap < 0 or chunk_overlap >= chunk_size:
+            raise ValueError("chunk_overlap must be >= 0 and smaller than chunk_size")
+
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+        )
+        chunks = splitter.split_documents(documents)
+        chunks = [chunk for chunk in chunks if chunk.page_content.strip()]
+
     if not chunks:
         raise ValueError("Chunking produced no text")
 
@@ -204,6 +213,32 @@ def index_file(
     store = _vector_store(chunks)
     retriever = store.as_retriever(search_kwargs={"k": k})
     return IndexedFile(str(Path(file_path).expanduser()), documents, chunks, store, retriever)
+
+
+def _is_csv(documents: list[Document]) -> bool:
+    if not documents:
+        return False
+    source = str(documents[0].metadata.get("source") or "")
+    return Path(source).suffix.lower() == ".csv"
+
+
+def _group_csv_rows(documents: list[Document], rows_per_chunk: int) -> list[Document]:
+    """Join CSV row documents into chunks of rows_per_chunk rows."""
+    chunks = []
+    for start in range(0, len(documents), rows_per_chunk):
+        group = documents[start:start + rows_per_chunk]
+        content = "\n\n".join(
+            document.page_content.strip()
+            for document in group
+            if document.page_content.strip()
+        )
+        if not content:
+            continue
+        metadata = dict(group[0].metadata)
+        metadata["row_start"] = group[0].metadata.get("row", start)
+        metadata["row_end"] = group[-1].metadata.get("row", start + len(group) - 1)
+        chunks.append(Document(page_content=content, metadata=metadata))
+    return chunks
 
 
 def _vector_store(chunks: list[Document]) -> InMemoryVectorStore:
