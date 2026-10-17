@@ -17,13 +17,13 @@ Those 4 chunks are placed into one prompt. The chat model answers from that text
 | --- | --- |
 | Search | similarity, top 4 |
 | Score | cosine similarity |
-| Embeddings | `gemini-embedding-001` |
+| Embeddings | `gemini-embedding-001`, batches of 5 with a 2 second pause |
 | Vector store | in memory, rebuilt each time a file is indexed |
 | Chunk size | 800 characters |
 | Chunk overlap | 120 characters |
 | Chat model | `gemini-flash-lite-latest`, temperature 0 |
 
-`k`, chunk size, and chunk overlap are arguments of `index_file` in `tools/rag_tools.py`. `RAG_CHAT_MODEL` and `RAG_EMBEDDING_MODEL` override the model names.
+`k`, chunk size, and chunk overlap are arguments of `index_file` in `tools/rag_tools.py`. `RAG_CHAT_MODEL` and `RAG_EMBEDDING_MODEL` override the model names. `RAG_EMBEDDING_BATCH_SIZE` and `RAG_EMBEDDING_BATCH_PAUSE` slow Google embedding calls down. `RAG_EMBEDDING_PROVIDER=local` uses `all-MiniLM-L6-v2` on this machine instead of the Google quota (`pip install sentence-transformers`).
 
 ## Run it
 

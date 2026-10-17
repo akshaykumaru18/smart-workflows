@@ -1,4 +1,6 @@
 import base64
+import csv
+import io
 import json
 import ssl
 import time
@@ -12,6 +14,8 @@ from urllib.request import Request, urlopen
 _API = "https://api.powerbi.com/v1.0/myorg"
 _FABRIC = "https://api.fabric.microsoft.com/v1"
 _TOKEN_CACHE = Path(__file__).resolve().parent.parent / ".powerbi_token_cache.json"
+_TABLE = "ReportData"
+_ROW_BATCH = 10000
 
 
 def _ssl_context():
@@ -342,12 +346,27 @@ def _column_type(value) -> str:
     return "String"
 
 
-def create_push_dataset(access_token: str, workspace_id: str, name: str, rows: list) -> dict:
-    """Create a push dataset in a workspace and load its rows."""
+def create_push_dataset(
+    access_token: str,
+    workspace_id: str,
+    name: str,
+    rows: list,
+    columns: list | None = None,
+    measures: list | None = None,
+) -> dict:
+    """Create a push dataset, load its rows, and add DAX measures when provided.
+
+    columns is a list of {"name", "dataType"}. dataType is String, Int64, Double,
+    Boolean, or DateTime. measures is a list of {"name", "expression"}.
+    """
     if not rows or not isinstance(rows[0], dict):
         raise ValueError("rows must be a list of objects")
 
-    columns = [{"name": key, "dataType": _column_type(value)} for key, value in rows[0].items()]
+    if columns is None:
+        columns = [{"name": key, "dataType": _column_type(value)} for key, value in rows[0].items()]
+    table_body = {"name": _TABLE, "columns": columns}
+    if measures:
+        table_body["measures"] = measures
     created = _request(
         access_token,
         "POST",
@@ -355,25 +374,232 @@ def create_push_dataset(access_token: str, workspace_id: str, name: str, rows: l
         {
             "name": name,
             "defaultMode": "Push",
-            "tables": [{"name": "ReportData", "columns": columns}],
+            "tables": [table_body],
         },
     )
     dataset_id = created["id"]
-    table = quote("ReportData", safe="")
-    _request(
-        access_token,
-        "POST",
-        f"/groups/{workspace_id}/datasets/{dataset_id}/tables/{table}/rows",
-        {"rows": rows},
-    )
+    _post_rows(access_token, workspace_id, dataset_id, rows)
     return {
         "dataset_id": dataset_id,
         "dataset_name": name,
         "workspace_id": workspace_id,
-        "table": "ReportData",
+        "table": _TABLE,
         "columns": [column["name"] for column in columns],
+        "measures": [measure["name"] for measure in measures or []],
         "row_count": len(rows),
         "web_url": f"https://app.powerbi.com/groups/{workspace_id}/datasets/{dataset_id}/details",
+    }
+
+
+def _post_rows(access_token: str, workspace_id: str, dataset_id: str, rows: list) -> None:
+    table = quote(_TABLE, safe="")
+    path = f"/groups/{workspace_id}/datasets/{dataset_id}/tables/{table}/rows"
+    for start in range(0, len(rows), _ROW_BATCH):
+        _request(access_token, "POST", path, {"rows": rows[start:start + _ROW_BATCH]})
+
+
+def execute_dax(access_token: str, workspace_id: str, dataset_id: str, query: str) -> dict:
+    """Run a DAX query against a dataset.
+
+    The workspace must be on a Premium, PPU, or Fabric capacity.
+    Example: EVALUATE ROW("Row Count", [Row Count])
+    """
+    text = str(query or "").strip()
+    if not text:
+        raise ValueError("query is required")
+    return _request(
+        access_token,
+        "POST",
+        f"/groups/{workspace_id}/datasets/{dataset_id}/executeQueries",
+        {
+            "queries": [{"query": text}],
+            "serializerSettings": {"includeNulls": True},
+        },
+    )
+
+
+def export_report_file(
+    access_token: str,
+    workspace_id: str,
+    report_id: str,
+    file_format: str = "PDF",
+    output_path: str | None = None,
+) -> dict:
+    """Export a report to PDF, PNG, or PPTX and save the file.
+
+    PNG of a multi-page report is saved as a zip. The workspace must be on a
+    Premium, PPU, Embedded, or Fabric capacity.
+    """
+    fmt = (file_format or "PDF").strip().upper()
+    if fmt not in {"PDF", "PNG", "PPTX"}:
+        raise ValueError("file_format must be PDF, PNG, or PPTX")
+    started = _request(
+        access_token,
+        "POST",
+        f"/groups/{workspace_id}/reports/{report_id}/ExportTo",
+        {"format": fmt},
+    )
+    export_id = started["id"]
+    status = started
+    for _ in range(40):
+        if status.get("status") in {"Succeeded", "Failed"}:
+            break
+        time.sleep(3)
+        status = _request(
+            access_token,
+            "GET",
+            f"/groups/{workspace_id}/reports/{report_id}/exports/{export_id}",
+        )
+    if status.get("status") != "Succeeded":
+        raise RuntimeError(f"Power BI export did not succeed: {json.dumps(status)}")
+
+    request = Request(
+        f"{_API}/groups/{workspace_id}/reports/{report_id}/exports/{export_id}/file",
+        headers={"Authorization": f"Bearer {access_token}"},
+        method="GET",
+    )
+    try:
+        with urlopen(request, timeout=120, context=_ssl_context()) as response:
+            payload = response.read()
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Power BI export download failed ({exc.code}): {detail}") from exc
+    except URLError as exc:
+        raise RuntimeError(f"Power BI export download failed: {exc.reason}") from exc
+
+    folder = Path("reports")
+    folder.mkdir(parents=True, exist_ok=True)
+    suffix = fmt.lower()
+    if fmt == "PNG" and payload[:2] == b"PK":
+        suffix = "zip"
+    destination = Path(output_path) if output_path else folder / f"{report_id}.{suffix}"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(payload)
+    return {
+        "report_id": report_id,
+        "format": fmt,
+        "path": str(destination),
+        "bytes": len(payload),
+    }
+
+
+def _sections(columns: list[str], pages: list | None) -> list:
+    if not pages:
+        return [_section(0, "Page 1", [_table_container(columns)])]
+    sections = []
+    for index, page in enumerate(pages):
+        containers = [_chart_container(visual) for visual in page["visuals"]]
+        sections.append(_section(index, page["title"], containers))
+    return sections
+
+
+def _section(index: int, title: str, containers: list) -> dict:
+    return {
+        "id": index,
+        "name": f"ReportSection{index}",
+        "displayName": title,
+        "filters": "[]",
+        "ordinal": index,
+        "visualContainers": containers,
+        "config": "{}",
+        "displayOption": 1,
+        "width": 1280,
+        "height": 720,
+    }
+
+
+def _table_container(columns: list[str]) -> dict:
+    return {
+        "x": 20,
+        "y": 20,
+        "z": 0,
+        "width": 900,
+        "height": 480,
+        "config": _visual_config(columns),
+        "filters": "[]",
+    }
+
+
+def _chart_container(visual: dict) -> dict:
+    return {
+        "x": visual["x"],
+        "y": visual["y"],
+        "z": 0,
+        "width": visual["width"],
+        "height": visual["height"],
+        "config": json.dumps(_chart_config(visual)),
+        "filters": "[]",
+    }
+
+
+def _chart_config(visual: dict) -> dict:
+    chart = visual["chart"]
+    visual_type = {
+        "horizontal_bar": "clusteredBarChart",
+        "bar": "clusteredColumnChart",
+        "line": "lineChart",
+        "table": "tableEx",
+    }.get(chart)
+    if visual_type is None:
+        raise ValueError(f"Unknown chart '{chart}'. Use horizontal_bar, bar, line, or table.")
+    category = _column_select(visual["dimension"])
+    measure = _measure_select(visual.get("measure_name") or f"Total {visual['measure']}")
+    if chart == "table":
+        projections = {"Values": [{"queryRef": category["Name"]}, {"queryRef": measure["Name"]}]}
+    else:
+        projections = {
+            "Category": [{"queryRef": category["Name"]}],
+            "Y": [{"queryRef": measure["Name"]}],
+        }
+    return {
+        "name": uuid.uuid4().hex[:16],
+        "layouts": [
+            {
+                "id": 0,
+                "position": {
+                    "x": visual["x"],
+                    "y": visual["y"],
+                    "z": 0,
+                    "width": visual["width"],
+                    "height": visual["height"],
+                    "tabOrder": 0,
+                },
+            }
+        ],
+        "singleVisual": {
+            "visualType": visual_type,
+            "projections": projections,
+            "prototypeQuery": {
+                "Version": 2,
+                "From": [{"Name": "d", "Entity": _TABLE, "Type": 0}],
+                "Select": [category, measure],
+            },
+            "drillFilterOtherVisuals": True,
+        },
+    }
+
+
+def _column_select(column: str) -> dict:
+    name = f"{_TABLE}.{column}"
+    return {
+        "Column": {
+            "Expression": {"SourceRef": {"Source": "d"}},
+            "Property": column,
+        },
+        "Name": name,
+        "NativeReferenceName": column,
+    }
+
+
+def _measure_select(measure_name: str) -> dict:
+    name = f"{_TABLE}.{measure_name}"
+    return {
+        "Measure": {
+            "Expression": {"SourceRef": {"Source": "d"}},
+            "Property": measure_name,
+        },
+        "Name": name,
+        "NativeReferenceName": measure_name,
     }
 
 
@@ -422,8 +648,14 @@ def create_pbix(
     workspace_name: str,
     columns: list[str],
     path: str | None = None,
+    pages: list | None = None,
 ) -> str:
-    """Write a .pbix report bound to an existing Power BI dataset."""
+    """Write a .pbix report bound to an existing Power BI dataset.
+
+    pages is a list of {"title", "visuals"}. Each visual has chart, dimension,
+    measure, measure_name, x, y, width, and height. chart is horizontal_bar,
+    bar, line, or table. Without pages, the file has one table of columns.
+    """
     if not workspace_name:
         raise ValueError("workspace_name is required")
     safe_name = "".join(char if char.isalnum() else "_" for char in dataset_name).strip("_") or "report"
@@ -435,30 +667,7 @@ def create_pbix(
         "id": 0,
         "layoutOptimization": 0,
         "resourcePackages": [],
-        "sections": [
-            {
-                "id": 0,
-                "name": "ReportSection",
-                "displayName": "Page 1",
-                "filters": "[]",
-                "ordinal": 0,
-                "visualContainers": [
-                    {
-                        "x": 20,
-                        "y": 20,
-                        "z": 0,
-                        "width": 900,
-                        "height": 480,
-                        "config": _visual_config(columns),
-                        "filters": "[]",
-                    }
-                ],
-                "config": "{}",
-                "displayOption": 1,
-                "width": 1280,
-                "height": 720,
-            }
-        ],
+        "sections": _sections(columns, pages),
         "config": json.dumps(
             {
                 "version": "5.41",
@@ -543,3 +752,366 @@ def import_pbix(access_token: str, workspace_id: str, pbix_path: str, display_na
             return current
         time.sleep(2)
     return current
+
+
+def publish_powerbi_report(
+    access_token: str,
+    workspace_id: str,
+    file_path: str,
+    name: str | None = None,
+    chart: str | None = None,
+    dimension: str | None = None,
+    measure: str | None = None,
+) -> dict:
+    """Publish a CSV as a push dataset with DAX measures and a report of charts.
+
+    Leave chart, dimension, and measure empty so pages follow the file's columns:
+    a bar for each numeric column by a category, and a line over a date column.
+    """
+    columns, rows, kinds = _load_csv(file_path)
+    columns, rows, kinds, views = _views_for(columns, rows, kinds, chart, dimension, measure)
+    schema, typed_rows = _schema_and_rows(columns, kinds, rows)
+    measure_defs, measure_names = _measures_for(columns, views)
+    pages = _report_pages(views, measure_names)
+    report_name = name or Path(file_path).stem
+    workspace = get_workspace(access_token, workspace_id)
+    dataset = create_push_dataset(
+        access_token,
+        workspace_id,
+        report_name,
+        typed_rows,
+        columns=schema,
+        measures=measure_defs,
+    )
+    pbix_path = create_pbix(
+        dataset["dataset_id"],
+        report_name,
+        workspace.get("name") or workspace_id,
+        columns,
+        pages=pages,
+    )
+    imported = import_pbix(access_token, workspace_id, pbix_path, report_name)
+    if imported.get("importState") != "Succeeded":
+        raise RuntimeError(f"Power BI import did not succeed: {json.dumps(imported)}")
+    report = (imported.get("reports") or [{}])[0]
+    report_id = report.get("id")
+    return {
+        "name": report_name,
+        "file_path": file_path,
+        "row_count": len(typed_rows),
+        "workspace_id": workspace_id,
+        "dataset_id": dataset["dataset_id"],
+        "dataset_url": dataset["web_url"],
+        "report_id": report_id,
+        "report_url": report.get("webUrl")
+        or (
+            f"https://app.powerbi.com/groups/{workspace_id}/reports/{report_id}"
+            if report_id
+            else None
+        ),
+        "pages": [page["title"] for page in pages],
+        "measures": measure_defs,
+        "pbix_path": pbix_path,
+    }
+
+
+def _load_csv(file_path: str) -> tuple:
+    from tools.file_tools import read_file
+
+    text = read_file(file_path)
+    if text.startswith("\ufeff"):
+        text = text[1:]
+    reader = csv.DictReader(io.StringIO(text))
+    if not reader.fieldnames:
+        raise ValueError(f"CSV has no header row: {file_path}")
+
+    columns = []
+    sources = []
+    for original in reader.fieldnames:
+        if original is None or not str(original).strip():
+            continue
+        header = str(original).strip()
+        if header in columns:
+            raise ValueError(f"Duplicate column: {header}")
+        columns.append(header)
+        sources.append(original)
+    if not columns:
+        raise ValueError(f"CSV has no columns: {file_path}")
+
+    rows = []
+    for raw in reader:
+        row = {header: (raw.get(source) or "").strip() for header, source in zip(columns, sources)}
+        if any(row.values()):
+            rows.append(row)
+    if not rows:
+        raise ValueError(f"CSV has no data rows: {file_path}")
+    return columns, rows, _column_kinds(columns, rows)
+
+
+def _column_kinds(columns: list, rows: list) -> dict:
+    kinds = {}
+    for name in columns:
+        values = [row[name] for row in rows if row[name] != ""]
+        if values and all(_looks_like_date(value) for value in values):
+            kinds[name] = "date"
+        elif values and all(_is_number(value) for value in values):
+            kinds[name] = "number"
+        else:
+            kinds[name] = "text"
+    return kinds
+
+
+def _looks_like_date(value: str) -> bool:
+    if len(value) < 10 or value[4] != "-" or value[7] != "-":
+        return False
+    if len(value) > 10 and value[10] not in " T":
+        return False
+    try:
+        year, month, day = int(value[0:4]), int(value[5:7]), int(value[8:10])
+    except ValueError:
+        return False
+    return year >= 1000 and 1 <= month <= 12 and 1 <= day <= 31
+
+
+def _is_number(value: str) -> bool:
+    try:
+        float(value)
+    except ValueError:
+        return False
+    return True
+
+
+def _is_identifier(name: str, rows: list) -> bool:
+    folded = "".join(ch.lower() if ch.isalnum() else " " for ch in name)
+    tokens = [token for token in folded.split() if token]
+    if "id" not in tokens and not folded.replace(" ", "").endswith("id"):
+        return False
+    if folded.replace(" ", "").endswith("valid"):
+        return False
+    values = [row[name] for row in rows if row[name] != ""]
+    if not values:
+        return False
+    return len(set(values)) >= len(values) * 0.9
+
+
+def _is_category(distinct: int, nonempty: int) -> bool:
+    if distinct < 2 or distinct > 30 or nonempty == 0:
+        return False
+    return (distinct / nonempty) <= 0.5 or distinct <= 8
+
+
+def _views_for(columns: list, rows: list, kinds: dict, chart, dimension, measure) -> tuple:
+    if chart or dimension or measure:
+        return columns, rows, kinds, [_one_view(columns, kinds, chart, dimension, measure)]
+    return _views_from_data(columns, rows, kinds)
+
+
+def _one_view(columns: list, kinds: dict, chart, dimension, measure) -> dict:
+    requested = (chart or "table").strip().lower()
+    charts = {
+        "bar": "bar",
+        "bar chart": "bar",
+        "column": "bar",
+        "horizontal bar": "horizontal_bar",
+        "horizontal_bar": "horizontal_bar",
+        "line": "line",
+        "line chart": "line",
+        "table": "table",
+        "text": "table",
+    }
+    kind = charts.get(requested)
+    if kind is None:
+        raise ValueError("Unknown chart. Use table, bar, horizontal_bar, or line.")
+    text = [name for name in columns if kinds[name] in {"text", "date"}]
+    numbers = [name for name in columns if kinds[name] == "number"]
+    dimension_name = _match_column(dimension, columns) or (text[0] if text else None)
+    measure_name = _match_column(measure, columns) or (numbers[0] if numbers else None)
+    if dimension_name is None or measure_name is None:
+        raise ValueError(
+            "Choose a text or date dimension and a numeric measure from the file. "
+            f"Columns: {', '.join(columns)}."
+        )
+    if kinds[dimension_name] not in {"text", "date"}:
+        raise ValueError(f"{dimension_name} is numeric. Use a text or date column as the dimension.")
+    if kinds[measure_name] != "number":
+        raise ValueError(f"{measure_name} is not numeric. Use a numeric column as the measure.")
+    return _sheet(kind, dimension_name, measure_name)
+
+
+def _views_from_data(columns: list, rows: list, kinds: dict) -> tuple:
+    columns = list(columns)
+    kinds = dict(kinds)
+    profiles = {name: [row[name] for row in rows if row[name] != ""] for name in columns}
+    measures = [
+        name
+        for name in columns
+        if kinds[name] == "number" and not _is_identifier(name, rows)
+    ][:4]
+    categories = [
+        name
+        for name in columns
+        if kinds[name] == "text"
+        and not _is_identifier(name, rows)
+        and _is_category(len(set(profiles[name])), len(profiles[name]))
+    ]
+    categories.sort(key=lambda name: (len(set(profiles[name])), columns.index(name)))
+    categories = categories[:4]
+    dates = [name for name in columns if kinds[name] == "date" and not _is_identifier(name, rows)]
+    if not measures and (categories or dates):
+        measure_name = "Row Count" if "Records" in columns else "Records"
+        columns.append(measure_name)
+        kinds[measure_name] = "number"
+        for row in rows:
+            row[measure_name] = "1"
+        measures = [measure_name]
+    views = []
+    if categories and measures:
+        for measure in measures:
+            views.append(_sheet("horizontal_bar", categories[0], measure))
+    if dates and measures:
+        for measure in measures:
+            views.append(_sheet("line", dates[0], measure))
+    if categories and measures:
+        for category in categories[1:]:
+            views.append(_sheet("horizontal_bar", category, measures[0]))
+    if not views:
+        labels = ", ".join(f"{name} ({kinds[name]})" for name in columns)
+        raise ValueError(
+            "This file has no category or date column to graph against its numbers. "
+            f"Columns: {labels}."
+        )
+    unique = []
+    seen = set()
+    for view in views:
+        if view["sheet"] in seen:
+            continue
+        seen.add(view["sheet"])
+        unique.append(view)
+    return columns, rows, kinds, unique[:8]
+
+
+def _sheet(chart: str, dimension: str, measure: str) -> dict:
+    return {
+        "chart": chart,
+        "dimension": dimension,
+        "measure": measure,
+        "sheet": f"{measure} by {dimension}",
+    }
+
+
+def _match_column(name: str | None, columns: list) -> str | None:
+    if name is None or not str(name).strip():
+        return None
+    wanted = str(name).strip().lower()
+    for column in columns:
+        if column.lower() == wanted:
+            return column
+    raise ValueError(f"Column not in the file: {name}. Columns: {', '.join(columns)}")
+
+
+def _schema_and_rows(columns: list, kinds: dict, rows: list) -> tuple:
+    number_types = {}
+    schema = []
+    for name in columns:
+        if kinds[name] == "number":
+            values = [row[name] for row in rows if row[name] != ""]
+            number_types[name] = _number_type(values)
+            schema.append({"name": name, "dataType": number_types[name]})
+        elif kinds[name] == "date":
+            schema.append({"name": name, "dataType": "DateTime"})
+        else:
+            schema.append({"name": name, "dataType": "String"})
+    typed_rows = []
+    for row in rows:
+        typed = {}
+        for name in columns:
+            raw = row[name]
+            if raw == "":
+                typed[name] = None
+            elif kinds[name] == "number":
+                number = float(raw)
+                typed[name] = int(number) if number_types[name] == "Int64" else number
+            elif kinds[name] == "date":
+                typed[name] = raw if "T" in raw else f"{raw[:10]}T00:00:00"
+            else:
+                typed[name] = raw
+        typed_rows.append(typed)
+    return schema, typed_rows
+
+
+def _number_type(values: list) -> str:
+    for value in values:
+        if not float(value).is_integer():
+            return "Double"
+    return "Int64"
+
+
+def _measures_for(columns: list, views: list) -> tuple:
+    row_name = "Row Count" if "Row Count" not in columns else "Report Row Count"
+    measures = [
+        {
+            "name": row_name,
+            "expression": f"COUNTROWS({_dax_table(_TABLE)})",
+        }
+    ]
+    mapping = {}
+    for view in views:
+        column = view["measure"]
+        if column in mapping:
+            continue
+        measure_name = f"Total {column}"
+        if measure_name in columns:
+            measure_name = f"{measure_name} Measure"
+        mapping[column] = measure_name
+        measures.append(
+            {
+                "name": measure_name,
+                "expression": f"SUM({_dax_column(_TABLE, column)})",
+            }
+        )
+    return measures, mapping
+
+
+def _dax_table(name: str) -> str:
+    return "'" + name.replace("'", "''") + "'"
+
+
+def _dax_column(table: str, column: str) -> str:
+    return f"{_dax_table(table)}[{column.replace(']', ']]')}]"
+
+
+def _report_pages(views: list, measure_names: dict) -> list:
+    pages = []
+    for view in views:
+        pages.append(
+            {
+                "title": view["sheet"],
+                "visuals": [_placed(view, measure_names, 20, 20, 900, 480)],
+            }
+        )
+    if len(views) < 2:
+        return pages
+    titles = {view["sheet"] for view in views}
+    overview = "Dashboard" if "Overview" in titles else "Overview"
+    visuals = []
+    for index, view in enumerate(views[:4]):
+        column = index % 2
+        row = index // 2
+        visuals.append(
+            _placed(view, measure_names, 20 + column * 620, 20 + row * 340, 600, 320)
+        )
+    pages.append({"title": overview, "visuals": visuals})
+    return pages
+
+
+def _placed(view: dict, measure_names: dict, x: int, y: int, width: int, height: int) -> dict:
+    return {
+        "chart": view["chart"],
+        "dimension": view["dimension"],
+        "measure": view["measure"],
+        "measure_name": measure_names[view["measure"]],
+        "x": x,
+        "y": y,
+        "width": width,
+        "height": height,
+    }
