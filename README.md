@@ -10,8 +10,9 @@ The retriever is **dense top-k similarity search**.
 2. The question is embedded with the same model using the `RETRIEVAL_QUERY` task.
 3. Chunks live in LangChain's `InMemoryVectorStore`, which ranks them by **cosine similarity**.
 4. `as_retriever(search_kwargs={"k": 4})` uses LangChain's default `search_type="similarity"` and returns the **4 closest chunks**.
+5. If the question names the abstract, introduction, conclusion, or references, those heading chunks are used instead of the similarity result. A request to explain that section in simpler words is answered from those chunks.
 
-Those 4 chunks are placed into one prompt. The chat model answers from that text only. This is a single-query dense retrieval step: one embedding of the question, one similarity search, no second query and no rerank pass.
+Those chunks are placed into one prompt. The chat model answers from that text only.
 
 | Setting | Value |
 | --- | --- |

@@ -53,9 +53,12 @@ ANSWER_PROMPT = ChatPromptTemplate.from_messages(
         (
             "system",
             "You answer questions about one uploaded document. "
-            "Use only the context. If the context does not contain the answer, "
+            "Use only the context. When the user asks you to explain, summarize, "
+            "or simplify a part of the document, rewrite that part from the context "
+            "in the style they asked for. "
+            "If the context does not contain the part they asked about, "
             f"reply exactly: {NOT_FOUND} "
-            "Do not use outside knowledge, and do not guess.",
+            "Do not add facts that are not in the context.",
         ),
         ("human", "Context:\n{context}\n\nQuestion: {question}"),
     ]
@@ -121,11 +124,19 @@ def build_retriever(chunks: list[Document], k: int = RETRIEVAL_K):
     return store.as_retriever(search_kwargs={"k": k})
 
 
-def retrieve(retriever, question: str) -> list[Document]:
-    """Return the chunks most similar to the question."""
+def retrieve(retriever, question: str, chunks: list[Document] | None = None) -> list[Document]:
+    """Return the chunks most similar to the question.
+
+    A question that names a section, such as the abstract, uses the chunks
+    that contain that heading. Similarity search misses those when the
+    wording of the question is unlike the section text.
+    """
     question = question.strip()
     if not question:
         raise ValueError("question is empty")
+    section_hits = _section_chunks(chunks or [], question)
+    if section_hits:
+        return section_hits
     return retriever.invoke(question)
 
 
@@ -168,7 +179,7 @@ class IndexedFile:
 
     def retrieve(self, question: str) -> list[Document]:
         """Return the chunks most similar to the question."""
-        return retrieve(self.retriever, question)
+        return retrieve(self.retriever, question, self.chunks)
 
     def answer(self, question: str) -> dict:
         """Answer from retrieved chunks and include those chunks as sources."""
@@ -376,6 +387,32 @@ def _source(document: Document) -> dict:
         "location": _location(document),
         "text": document.page_content.strip(),
     }
+
+
+def _named_section(question: str) -> str | None:
+    for name in ("abstract", "introduction", "conclusion", "references"):
+        if re.search(rf"\b{name}\b", question, flags=re.IGNORECASE):
+            return name
+    return None
+
+
+def _section_chunks(chunks: list[Document], question: str) -> list[Document]:
+    section = _named_section(question)
+    if section is None:
+        return []
+    heading = re.compile(rf"(?im)(?:^|\n)\s*{section}\s*[—–:\-.]")
+    selected = []
+    seen = set()
+    for index, chunk in enumerate(chunks):
+        if not heading.search(chunk.page_content):
+            continue
+        for follow in chunks[index:index + 3]:
+            key = follow.metadata.get("chunk")
+            if key in seen:
+                continue
+            seen.add(key)
+            selected.append(follow)
+    return selected
 
 
 def _location(document: Document) -> str:
